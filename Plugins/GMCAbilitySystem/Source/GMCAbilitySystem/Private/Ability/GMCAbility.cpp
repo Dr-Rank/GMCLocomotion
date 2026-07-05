@@ -1,0 +1,469 @@
+﻿#include "Ability/GMCAbility.h"
+#include "GMCAbilitySystem.h"
+#include "GMCPawn.h"
+#include "Ability/Tasks/GMCAbilityTaskBase.h"
+#include "Components/GMCAbilityComponent.h"
+
+UWorld* UGMCAbility::GetWorld() const
+{
+	if (HasAllFlags(RF_ClassDefaultObject))
+	{
+		// If we're a CDO, we *must* return nullptr to avoid causing issues with
+		// UObject::ImplementsGetWorld(), which just blithely and blindly calls GetWorld().
+		return nullptr;
+	}
+
+#if WITH_EDITOR
+	if (GIsEditor)
+	{
+		return GWorld;
+	}
+#endif // WITH_EDITOR
+
+	// Sanity check rather than blindly accessing the world context array.
+	auto Contexts = GEngine->GetWorldContexts();
+	if (Contexts.Num() == 0)
+	{
+		UE_LOG(LogGMCAbilitySystem, Error, TEXT("%s: instanciated class with no valid world!"), *GetClass()->GetName())
+			return nullptr;
+	}
+
+	return Contexts[0].World();
+}
+
+bool UGMCAbility::IsActive() const
+{
+	return AbilityState != EAbilityState::PreExecution && AbilityState != EAbilityState::Ended;
+}
+
+void UGMCAbility::Tick(float DeltaTime)
+{
+	// Don't tick before the ability is initialized or after it has ended
+	if (AbilityState == EAbilityState::PreExecution || AbilityState == EAbilityState::Ended) return;
+
+	if (!OwnerAbilityComponent->HasAuthority())
+	{
+		if (!bServerConfirmed && ClientStartTime + ServerConfirmTimeout < OwnerAbilityComponent->ActionTimer)
+		{
+			UE_LOG(LogGMCAbilitySystem, Error, TEXT("Ability Not Confirmed By Server: %d, Removing..."), AbilityID);
+			EndAbility();
+			return;
+		}
+	}
+
+	if (bEndPending) {
+		EndAbility();
+		return;
+	}
+
+	TickTasks(DeltaTime);
+	TickEvent(DeltaTime);
+}
+
+void UGMCAbility::AncillaryTick(float DeltaTime) {
+	// Don't tick before the ability is initialized or after it has ended
+	if (AbilityState == EAbilityState::PreExecution || AbilityState == EAbilityState::Ended) return;
+
+	AncillaryTickTasks(DeltaTime);
+	AncillaryTickEvent(DeltaTime);
+}
+
+void UGMCAbility::TickTasks(float DeltaTime)
+{
+	for (int i = 0; i < RunningTasks.Num(); i++)
+	{
+		UGMCAbilityTaskBase* Task = RunningTasks[i];
+		if (Task == nullptr) { continue; }
+		Task->Tick(DeltaTime);
+	}
+}
+
+void UGMCAbility::AncillaryTickTasks(float DeltaTime) {
+	for (int i = 0; i < RunningTasks.Num(); i++)
+	{
+		UGMCAbilityTaskBase* Task = RunningTasks[i];
+		if (Task == nullptr) { continue; }
+		Task->AncillaryTick(DeltaTime);
+	}
+}
+
+void UGMCAbility::Execute(UGMC_AbilitySystemComponent* InAbilityComponent, int InAbilityID, const UInputAction* InputAction)
+{
+	// TODO : Add input action tag here to avoid going by the old FGMCAbilityData struct
+	this->AbilityInputAction = InputAction;
+	this->AbilityID = InAbilityID;
+	this->OwnerAbilityComponent = InAbilityComponent;
+	this->ClientStartTime = InAbilityComponent->ActionTimer;
+	PreBeginAbility();
+}
+
+bool UGMCAbility::CanAffordAbilityCost(float DeltaTime) const
+{
+	if (AbilityCost == nullptr || OwnerAbilityComponent == nullptr) return true;
+
+	UGMCAbilityEffect* AbilityEffect = AbilityCost->GetDefaultObject<UGMCAbilityEffect>();
+	for (FGMCAttributeModifier AttributeModifier : AbilityEffect->EffectData.Modifiers)
+	{
+		for (const FAttribute* Attribute : OwnerAbilityComponent->GetAllAttributes())
+		{
+			if (Attribute->Tag.MatchesTagExact(AttributeModifier.AttributeTag))
+			{
+				AttributeModifier.InitModifier(AbilityEffect, OwnerAbilityComponent->ActionTimer, -1.f, false, DeltaTime);
+				if (Attribute->Value + AttributeModifier.CalculateModifierValue(*Attribute) < 0.f)
+				{
+					return false;
+				}
+			}
+		}
+	}
+
+	return true;
+}
+
+void UGMCAbility::CommitAbilityCostAndCooldown()
+{
+	CommitAbilityCost();
+	CommitAbilityCooldown();
+}
+
+void UGMCAbility::CommitAbilityCooldown()
+{
+	if (CooldownTime <= 0.f || OwnerAbilityComponent == nullptr) return;
+	OwnerAbilityComponent->SetCooldownForAbility(AbilityTag, CooldownTime);
+}
+
+void UGMCAbility::CommitAbilityCost()
+{
+	if (AbilityCost == nullptr || OwnerAbilityComponent == nullptr) return;
+
+	const UGMCAbilityEffect* EffectCDO = DuplicateObject(AbilityCost->GetDefaultObject<UGMCAbilityEffect>(), this);
+	FGMCAbilityEffectData EffectData = EffectCDO->EffectData;
+	EffectData.OwnerAbilityComponent = OwnerAbilityComponent;
+	EffectData.SourceAbilityComponent = OwnerAbilityComponent;
+	AbilityCostInstance = OwnerAbilityComponent->ApplyAbilityEffect(DuplicateObject(EffectCDO, this), EffectData);
+}
+
+void UGMCAbility::RemoveAbilityCost() {
+	if (AbilityCostInstance) {
+		OwnerAbilityComponent->RemoveActiveAbilityEffect(AbilityCostInstance);
+	}
+}
+
+
+void UGMCAbility::ModifyBlockOtherAbility(FGameplayTagContainer TagToAdd, FGameplayTagContainer TagToRemove) {
+	for (auto Tag : TagToAdd) {
+		BlockOtherAbility.AddTag(Tag);
+	}
+
+	for (auto Tag : TagToRemove) {
+		BlockOtherAbility.RemoveTag(Tag);
+	}
+}
+
+
+void UGMCAbility::ResetBlockOtherAbility() {
+	BlockOtherAbility = GetClass()->GetDefaultObject<UGMCAbility>()->BlockOtherAbility;
+}
+
+
+void UGMCAbility::HandleTaskData(int TaskID, FInstancedStruct TaskData)
+{
+	const FGMCAbilityTaskData TaskDataFromInstance = TaskData.Get<FGMCAbilityTaskData>();
+	if (RunningTasks.Contains(TaskID) && RunningTasks[TaskID] != nullptr)
+	{
+		if (TaskDataFromInstance.TaskType == EGMCAbilityTaskDataType::Progress)
+		{
+			RunningTasks[TaskID]->ProgressTask(TaskData);
+		}
+	}
+}
+
+void UGMCAbility::HandleTaskHeartbeat(int TaskID)
+{
+	if (RunningTasks.Contains(TaskID) && RunningTasks[TaskID] != nullptr) // Do we ever remove orphans tasks ?
+	{
+		RunningTasks[TaskID]->Heartbeat();
+	}
+}
+
+void UGMCAbility::CancelConflictingAbilities()
+{
+	for (const auto& AbilityToCancelTag : CancelAbilitiesWithTag) {
+		if (AbilityTag == AbilityToCancelTag) {
+			UE_LOG(LogGMCAbilitySystem, Warning, TEXT("Ability (tag) %s is trying to cancel itself, if you attempt to reset the ability, please use //TODO instead"), *AbilityTag.ToString());
+			continue;
+		}
+
+		if (OwnerAbilityComponent->EndAbilitiesByTag(AbilityToCancelTag)) {
+			UE_LOG(LogGMCAbilitySystem, Verbose, TEXT("Ability (tag) %s has been cancelled by (tag) %s"), *AbilityTag.ToString(), *AbilityToCancelTag.ToString());
+		}
+	}
+
+	if (!EndOtherAbilitiesQuery.IsEmpty())
+	{
+		for (const auto& ActiveAbility : OwnerAbilityComponent->GetActiveAbilities())
+		{
+			if (ActiveAbility.Value == this) continue;
+
+			if (EndOtherAbilitiesQuery.Matches(ActiveAbility.Value->AbilityDefinition))
+			{
+				ActiveAbility.Value->SetPendingEnd();
+				UE_LOG(LogGMCAbilitySystem, Verbose, TEXT("Ability %s cancelled ability %s (matching definition query)"),
+					*AbilityTag.ToString(), *ActiveAbility.Value->AbilityTag.ToString());
+			}
+		}
+	}
+}
+
+
+void UGMCAbility::ServerConfirm()
+{
+	bServerConfirmed = true;
+}
+
+
+void UGMCAbility::SetPendingEnd() {
+	bEndPending = true;
+}
+
+
+UGameplayTasksComponent* UGMCAbility::GetGameplayTasksComponent(const UGameplayTask& Task) const
+{
+	if (OwnerAbilityComponent != nullptr) { return OwnerAbilityComponent; }
+	return nullptr;
+}
+
+AActor* UGMCAbility::GetGameplayTaskOwner(const UGameplayTask* Task) const
+{
+	if (OwnerAbilityComponent != nullptr) { return OwnerAbilityComponent->GetOwner(); }
+	return nullptr;
+}
+
+AActor* UGMCAbility::GetGameplayTaskAvatar(const UGameplayTask* Task) const
+{
+	// Wtf is avatar?
+	if (OwnerAbilityComponent != nullptr) { return OwnerAbilityComponent->GetOwner(); }
+	return nullptr;
+}
+
+void UGMCAbility::OnGameplayTaskInitialized(UGameplayTask& Task)
+{
+	UGMCAbilityTaskBase* AbilityTask = Cast<UGMCAbilityTaskBase>(&Task);
+	if (!AbilityTask)
+	{
+		// UE_LOG(LogGMCAbilitySystem, Error, TEXT("UGMCAbility::OnGameplayTaskInitialized called with non-UGMCAbilityTaskBase task"));
+		return;
+	}
+	AbilityTask->SetAbilitySystemComponent(OwnerAbilityComponent);
+	AbilityTask->Ability = this;
+
+}
+
+void UGMCAbility::OnGameplayTaskActivated(UGameplayTask& Task)
+{
+	ActiveTasks.Add(&Task);
+}
+
+void UGMCAbility::OnGameplayTaskDeactivated(UGameplayTask& Task)
+{
+	ActiveTasks.Remove(&Task);
+}
+
+
+void UGMCAbility::FinishEndAbility() {
+	
+	for (const TPair<int, UGMCAbilityTaskBase* >& Task : RunningTasks)
+	{
+		if (Task.Value == nullptr) continue;
+		Task.Value->EndTaskGMAS();
+	}
+
+	// End handled effect
+	for (const auto& EfData : DeclaredEffect)
+	{
+		// Skip Auth effect removal on client 
+		if (EfData.Value == EGMCAbilityEffectQueueType::ServerAuth && !OwnerAbilityComponent->HasAuthority())  { continue;}
+
+		if (UGMCAbilityEffect* Effect =	OwnerAbilityComponent->GetEffectById(EfData.Key))
+		{
+			// Don't try to close effects that are already ended
+			if (Effect->CurrentState == EGMASEffectState::Started)
+			{
+				OwnerAbilityComponent->RemoveActiveAbilityEffectSafe(Effect, EfData.Value);
+			}
+			else
+			{
+				UE_LOG(LogGMCAbilitySystem, Warning, TEXT("Effect Handle %d already ended for ability %s"), EfData.Key, *AbilityTag.ToString());
+			}
+		}
+		else
+		{
+			UE_LOG(LogGMCAbilitySystem, Error, TEXT("Effect Handle %d not found for ability %s"), EfData.Key, *AbilityTag.ToString());
+		}
+	}
+
+	AbilityState = EAbilityState::Ended;
+}
+
+
+bool UGMCAbility::IsOnCooldown() const
+{
+	return OwnerAbilityComponent->GetCooldownForAbility(AbilityTag) > 0;
+}
+
+
+bool UGMCAbility::PreExecuteCheckEvent_Implementation() {
+	return true;
+}
+
+
+void UGMCAbility::DeclareEffect(int OutEffectHandle, EGMCAbilityEffectQueueType EffectType)
+{
+	if (DeclaredEffect.Contains(OutEffectHandle))
+	{
+		UE_LOG(LogGMCAbilitySystem, Error, TEXT("Effect Handle %d already declared for ability %s"), OutEffectHandle, *AbilityTag.ToString());
+		return;
+	}
+	DeclaredEffect.Add(OutEffectHandle, EffectType);
+}
+
+bool UGMCAbility::PreBeginAbility()
+{
+	if (IsOnCooldown())
+	{
+		UE_LOG(LogGMCAbilitySystem, Verbose, TEXT("Ability Activation for %s Stopped By Cooldown"), *AbilityTag.ToString());
+		CancelAbility();
+		return false;
+	}
+
+	// PreCheck
+	if (!PreExecuteCheckEvent())
+	{
+		UE_LOG(LogGMCAbilitySystem, Verbose, TEXT("Ability Activation for %s Stopped By Failing PreExecution check"), *AbilityTag.ToString());
+		CancelAbility();
+		return false;
+	}
+
+
+	TArray<UGMCAbility*> ActiveAbilities;
+	OwnerAbilityComponent->GetActiveAbilities().GenerateValueArray(ActiveAbilities);
+
+	for (auto& OtherAbilityTag : BlockedByOtherAbility)
+	{
+		if (ActiveAbilities.FindByPredicate([&OtherAbilityTag](const UGMCAbility* ActiveAbility) {
+			return ActiveAbility
+			&& ActiveAbility->IsActive()
+			&& ActiveAbility->AbilityTag.MatchesTag(OtherAbilityTag);
+		}))
+		{
+			UE_LOG(LogGMCAbilitySystem, Verbose, TEXT("Ability Activation for %s Stopped because Blocked By Other Ability (%s)"), *AbilityTag.ToString(), *OtherAbilityTag.ToString());
+			CancelAbility();
+			return false;
+		}
+	}
+	
+
+	if (OwnerAbilityComponent->IsAbilityTagBlocked(AbilityTag)) {
+		UE_LOG(LogGMCAbilitySystem, Verbose, TEXT("Ability Activation for %s Stopped because Blocked By Other Ability"), *AbilityTag.ToString());
+		CancelAbility();
+		return false;
+	}
+
+
+	BeginAbility();
+
+	return true;
+}
+
+
+void UGMCAbility::BeginAbility()
+{
+
+
+	OwnerAbilityComponent->OnAbilityActivated.Broadcast(this, AbilityTag);
+
+	if (!BlockOtherAbilitiesQuery.IsEmpty())
+	{
+		FGameplayTagQuery BlockQuery = BlockOtherAbilitiesQuery;
+		for (auto& ActiveAbility : OwnerAbilityComponent->GetActiveAbilities())
+		{
+			const FGameplayTagContainer& ActiveAbilityTags = ActiveAbility.Value->AbilityDefinition;
+
+			if (BlockQuery.Matches(ActiveAbilityTags))
+			{
+				ActiveAbility.Value->SetPendingEnd();
+				UE_LOG(LogGMCAbilitySystem, Verbose, TEXT("Ability %s blocked ability %s (matching query)"),
+					*AbilityTag.ToString(), *ActiveAbility.Value->AbilityTag.ToString());
+			}
+		}
+	}
+
+	if (bApplyCooldownAtAbilityBegin)
+	{
+		CommitAbilityCooldown();
+	}
+
+	// Initialize Ability
+	AbilityState = EAbilityState::Initialized;
+
+	// Cancel Abilities in CancelAbilitiesWithTag container
+	CancelConflictingAbilities();
+
+	// Execute BP Event
+	BeginAbilityEvent();
+}
+
+void UGMCAbility::EndAbility()
+{
+	if (AbilityState != EAbilityState::Ended) {
+		FinishEndAbility();
+		EndAbilityEvent();
+		OwnerAbilityComponent->OnAbilityEnded.Broadcast(this);
+	}
+}
+
+
+void UGMCAbility::CancelAbility() {
+	if (AbilityState != EAbilityState::Ended) {
+		FinishEndAbility();
+	}
+}
+
+
+AActor* UGMCAbility::GetOwnerActor() const
+{
+	return OwnerAbilityComponent->GetOwner();
+}
+
+AGMC_Pawn* UGMCAbility::GetOwnerPawn() const {
+	if (AGMC_Pawn* OwningPawn = Cast<AGMC_Pawn>(GetOwnerActor())) {
+		return OwningPawn;
+	}
+	return nullptr;
+}
+
+AGMC_PlayerController* UGMCAbility::GetOwningPlayerController() const {
+	if (const AGMC_Pawn* OwningPawn = GetOwnerPawn()) {
+		if (AGMC_PlayerController* OwningPC = Cast<AGMC_PlayerController>(OwningPawn->GetController())) {
+			return OwningPC;
+		}
+	}
+	return nullptr;
+}
+
+float UGMCAbility::GetOwnerAttributeValueByTag(FGameplayTag AttributeTag) const
+{
+	return OwnerAbilityComponent->GetAttributeValueByTag(AttributeTag);
+}
+
+
+void UGMCAbility::SetOwnerJustTeleported(bool bValue)
+{
+	OwnerAbilityComponent->bJustTeleported = bValue;
+}
+
+void UGMCAbility::ModifyBlockOtherAbilitiesViaDefinitionQuery(const FGameplayTagQuery& NewQuery)
+{
+	BlockOtherAbilitiesQuery = NewQuery;
+	UE_LOG(LogGMCAbilitySystem, Verbose, TEXT("BlockOtherAbilityByDefinitionQuery modified: %s"), *NewQuery.GetDescription());
+}
