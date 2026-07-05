@@ -1,0 +1,26 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "GMC Ragdoll",
+	"Description": "Cosmetic ragdoll component for GMCv2. Each client runs independent physics simulation — no bone replication.",
+	"Category": "Gameplay",
+	"CreatedBy": "Execute Games",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "GMCRagdoll",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "GMC",
+			"Enabled": true
+		}
+	]
+}
