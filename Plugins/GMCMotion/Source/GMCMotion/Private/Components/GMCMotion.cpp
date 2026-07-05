@@ -1883,7 +1883,10 @@ bool UGMCMotion::IsStopPredicted(FVector& OutStopLocation) const
 
 bool UGMCMotion::IsPivotPredicted(FVector& OutPivotLocation) const
 {
-	if (!bPrecalculateDistanceMatches)
+	// Forward-only mode (DirectionThresholdMode == 2): suppress pivot prediction entirely.
+	// Pivot redirect animations rotate the upper body, which breaks first-person view
+	// where the head must always face the camera direction.
+	if (!bPrecalculateDistanceMatches || DirectionThresholdMode == 2)
 	{
 		OutPivotLocation = FVector::ZeroVector;
 		return false;
@@ -2044,6 +2047,20 @@ void UGMCMotion::UpdateTrajectoryMetrics()
 
 	Trj_FutureVelocity = ProjectVelocity(0.5f);
 	Trj_NearFutureVelocity = ProjectVelocity(0.1f);
+
+	// Forward-only mode (DirectionThresholdMode == 2): suppress turn-related trajectory
+	// metrics. In first person the pawn faces the camera, so velocity is always lateral
+	// during strafing — TurnAngle/FutureFacingDelta would permanently read ~±90° and
+	// IsCircling would always be true, causing the animation system to select turn/redirect
+	// animations that rotate the upper body away from the camera direction.
+	if (DirectionThresholdMode == 2)
+	{
+		Trj_TurnAngle = 0.0f;
+		FutureFacingDelta = 0.0f;
+		Trj_IsCircling = false;
+		TurningStrength = 0.0;
+		return;
+	}
 
 	// Turn angle: delta between current facing yaw and projected velocity direction.
 	if (!Trj_FutureVelocity.IsNearlyZero(1.0f))
