@@ -1,0 +1,57 @@
+# Build artifacts
+Binaries/
+!Plugins/AdvancedMultiplayerProjectiles/Binaries/
+!Plugins/AdvancedMultiplayerProjectiles/Binaries/**
+DerivedDataCache/
+Intermediate/
+Saved/
+
+# Ensure GMC itself is never checked in, even if we're testing a non-marketplace build
+Plugins/GMC
+
+# Don't check in the experimental motion matching samples until we're ready.
+# Plugins/GMCE_Motion
+Plugins/ThreepeatAnimTools
+
+# IDE artifacts
+.idea/
+.vs/
+.vsconfig
+*.pro
+*.pri
+*.kdev4
+*.sln
+*.DotSettings
+*.DotSettings.user
+
+# Version Control debris
+p4config.txt
+hidden_changes.conf
+ignore.conf
+debug.log
+
+# Unix backups
+*~
+
+# MacOS debris
+.DS_Store
+# Content/Characters
+Content/UltimateFPSKit
+# Content/FPS
+
+# Engram project-specific rules (generated)
+Plugins/Engram-Plugin_BFG
+Content/Plugins/Engram-Plugin_BFG/
+
+# Claude, Superpowers, Scripts, and docs
+/.claude/
+/.superpowers/brainstorm/
+/Scripts/
+/docs/
+/Plugins/NeoStackAI
+/.agents/skills/neostack-blueprint
+/.agents/skills/neostack-game-testing
+/.agents/skills/neostack-hello
+/.agents/skills/neostack-umg-design
+/.agents/skills/neostack-widget
+/.neostack
