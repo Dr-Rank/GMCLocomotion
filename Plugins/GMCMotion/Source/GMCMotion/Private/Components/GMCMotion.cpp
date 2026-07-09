@@ -1330,6 +1330,7 @@ void UGMCMotion::PrePhysicsUpdate_Implementation(float DeltaSeconds)
 	if (!bFacingInitialized && UpdatedComponent)
 	{
 		OverridenDesiredFacing = UpdatedComponent->GetComponentRotation();
+		FacingSpringPositionYaw = OverridenDesiredFacing.Yaw;
 		bFacingInitialized = true;
 	}
 
@@ -1566,15 +1567,34 @@ void UGMCMotion::ApplyRotation(bool bIsDirectBotMove, const FGMC_RootMotionVeloc
 	}
 
 	// Rate-limited rotation toward OverridenDesiredFacing.
-	// The BP's Update_Grounded sets OverridenDesiredFacing directly (IntentYaw + RotationOffset)
-	// and the C++ ApplyRotation smooths via RotateYawTowardsDirection. The rotation offset curves
-	// handle visual continuity at direction boundaries — no spring needed.
-	// ApplyFacingSpring (CriticalSpringDampQuat) exists in the BP but is dead code.
+	// UpdateGroundedFacing feeds the raw target into ApplyFacingSpring, which smoothly
+	// moves OverridenDesiredFacing via a critically-damped spring. This function then
+	// rotates the actor toward the smoothed target via RotateYawTowardsDirection.
 	const float YawBefore = UpdatedComponent ? UpdatedComponent->GetComponentRotation().Yaw : 0.f;
 
 	const FVector FacingDirection = OverridenDesiredFacing.Vector();
 	if (!FacingDirection.IsNearlyZero())
 	{
+		// --- DEBUG: log rotation state and mesh yaw during sprint ---
+		if (CurrentGait == EGMCMotion_Gait::Sprint && UpdatedComponent)
+		{
+			const float DbgDelta = FMath::FindDeltaAngleDegrees(YawBefore, OverridenDesiredFacing.Yaw);
+			if (FMath::Abs(DbgDelta) > 5.f)
+			{
+				float MeshYaw = 0.f;
+				if (SkeletalMesh)
+				{
+					MeshYaw = SkeletalMesh->GetComponentRotation().Yaw;
+				}
+				const float MeshCapsuleDelta = FMath::FindDeltaAngleDegrees(YawBefore, MeshYaw);
+				UE_LOG(LogTemp, Warning,
+					TEXT("[SprintRot] CapsuleYaw=%.1f FacingYaw=%.1f Delta=%.1f MeshYaw=%.1f MeshOffset=%.1f Speed=%.0f"),
+					YawBefore, OverridenDesiredFacing.Yaw, DbgDelta,
+					MeshYaw, MeshCapsuleDelta,
+					GetLinearVelocity_GMC().Size2D());
+			}
+		}
+
 		if (bUseSafeRotations)
 		{
 			RotateYawTowardsDirectionSafe(FacingDirection, RotationRate, SafeRotationCollisionTolerance, DeltaSeconds);
@@ -1591,6 +1611,16 @@ void UGMCMotion::ApplyRotation(bool bIsDirectBotMove, const FGMC_RootMotionVeloc
 		const float YawAfter = UpdatedComponent->GetComponentRotation().Yaw;
 		const float StepDeg = FMath::FindDeltaAngleDegrees(YawBefore, YawAfter);
 		AngularVelocityRad = FMath::DegreesToRadians(StepDeg / DeltaSeconds);
+
+		// --- DEBUG: log mesh vs capsule after rotation during sprint transitions ---
+		if (CurrentGait == EGMCMotion_Gait::Sprint && FMath::Abs(StepDeg) > 5.f && SkeletalMesh)
+		{
+			const float MeshYawPost = SkeletalMesh->GetComponentRotation().Yaw;
+			const float OffsetRootBoneEst = FMath::FindDeltaAngleDegrees(YawAfter, MeshYawPost);
+			UE_LOG(LogTemp, Warning,
+				TEXT("[SprintMesh] CapsuleStep=%.1f CapsuleNow=%.1f MeshNow=%.1f OffsetRootBone~=%.1f"),
+				StepDeg, YawAfter, MeshYawPost, OffsetRootBoneEst);
+		}
 	}
 }
 
@@ -1852,11 +1882,45 @@ bool UGMCMotion::IsStopPredicted(FVector& OutStopLocation) const
 		return false;
 	}
 
-	// No input + moving = predict stop using kinematic equation
 	const FVector Vel = GetLinearVelocity_GMC();
 	const float Speed2D = Vel.Size2D();
 
-	if (Speed2D < 10.f || !GetProcessedInputVector().IsNearlyZero())
+	if (Speed2D < 10.f)
+	{
+		OutStopLocation = FVector::ZeroVector;
+		return false;
+	}
+
+	bool bShouldStop = false;
+
+	// Case 1: No input + moving = predict stop (original check).
+	if (GetProcessedInputVector().IsNearlyZero())
+	{
+		bShouldStop = true;
+	}
+	// Case 2: Sprint direction reversal in strafing/aiming mode. The character must
+	// decelerate to zero before accelerating in the new direction — kinematically
+	// equivalent to a stop. Without this, the animation system plays a pivot (body
+	// rotation) instead of a stop transition (feet planting without rotation).
+	else if (CurrentGait == EGMCMotion_Gait::Sprint
+		&& RotationMode == EGMCMotion_RotationMode::Aiming)
+	{
+		const FVector InputVec = GetProcessedInputVector();
+		const FVector Accel = InputVec * GetInputAcceleration();
+		if (!Accel.IsNearlyZero())
+		{
+			const FVector Vel2D(Vel.X, Vel.Y, 0.f);
+			const FVector Accel2D(Accel.X, Accel.Y, 0.f);
+			const float Dot = FVector::DotProduct(Vel2D.GetSafeNormal(), Accel2D.GetSafeNormal());
+			// Input is more than ~120° from velocity — character will decelerate to zero.
+			if (Dot < -0.5f)
+			{
+				bShouldStop = true;
+			}
+		}
+	}
+
+	if (!bShouldStop)
 	{
 		OutStopLocation = FVector::ZeroVector;
 		return false;
@@ -1892,6 +1956,31 @@ bool UGMCMotion::IsPivotPredicted(FVector& OutPivotLocation) const
 		return false;
 	}
 
+	// Sprint direction reversals in aiming mode are handled as STOP predictions (feet
+	// planting without body rotation) rather than pivots (body rotation). Suppress pivot
+	// here so the animation system picks the stop transition instead.
+	if (CurrentGait == EGMCMotion_Gait::Sprint
+		&& RotationMode == EGMCMotion_RotationMode::Aiming)
+	{
+		const FVector InputVec = GetProcessedInputVector();
+		if (!InputVec.IsNearlyZero())
+		{
+			const FVector Vel = GetLinearVelocity_GMC();
+			const FVector Accel = InputVec * GetInputAcceleration();
+			if (!Accel.IsNearlyZero() && Vel.Size2D() >= 10.f)
+			{
+				const FVector Vel2D(Vel.X, Vel.Y, 0.f);
+				const FVector Accel2D(Accel.X, Accel.Y, 0.f);
+				const float Dot = FVector::DotProduct(Vel2D.GetSafeNormal(), Accel2D.GetSafeNormal());
+				if (Dot < -0.5f)
+				{
+					OutPivotLocation = FVector::ZeroVector;
+					return false;
+				}
+			}
+		}
+	}
+
 	const FVector Vel = GetLinearVelocity_GMC();
 	const float Speed2D = Vel.Size2D();
 
@@ -1916,6 +2005,15 @@ bool UGMCMotion::IsPivotPredicted(FVector& OutPivotLocation) const
 	const float AngleDeg = FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(Dot, -1.f, 1.f)));
 
 	const float ClampedThreshold = FMath::Clamp(PivotPredictionAngleThreshold, 90.f, 179.f);
+
+	// --- DEBUG: log pivot detection during sprint ---
+	if (CurrentGait == EGMCMotion_Gait::Sprint)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[SprintPivot] Angle=%.1f Threshold=%.1f %s Speed=%.0f DirThreshMode=%d"),
+			AngleDeg, ClampedThreshold,
+			AngleDeg >= ClampedThreshold ? TEXT("PIVOT") : TEXT("no-pivot"),
+			Speed2D, DirectionThresholdMode);
+	}
 
 	if (AngleDeg < ClampedThreshold)
 	{
@@ -2008,8 +2106,20 @@ void UGMCMotion::ApplyFacingSpring(float TargetYaw, float DeltaSeconds)
 	const float HalfLife = FMath::Max(FacingSpringHalfLife, UE_KINDA_SMALL_NUMBER);
 	const float Omega = FMath::Loge(2.0f) / HalfLife;
 
-	// Displacement from target (wrapped to [-180, 180])
-	const float x0 = FMath::FindDeltaAngleDegrees(TargetYaw, OverridenDesiredFacing.Yaw);
+	// Displacement from target using the spring's own position state.
+	// We do NOT read OverridenDesiredFacing.Yaw here because the BP's Update_Grounded
+	// overwrites it every frame (direct clamp assignment), which destroys the spring's
+	// continuity. FacingSpringPositionYaw is only written by this function.
+	//
+	// FindDeltaAngleDegrees returns the shortest arc ([-180, 180]). For L↔R strafe
+	// transitions (~180° jump), the shortest arc passes through the camera direction
+	// (0°). This is CORRECT: in strafing mode the mesh stays forward-facing via the
+	// offset root bone while the capsule rotates underneath. The offset root bone
+	// absorbs small per-frame capsule deltas. Forcing the long arc (through ±180°/back)
+	// would exceed the offset root bone's max rotation error (~85°), dragging the mesh
+	// through a visible 180° spin.
+	const float x0 = FMath::FindDeltaAngleDegrees(TargetYaw, FacingSpringPositionYaw);
+
 	const float v0 = FacingSpringVelocityYaw;
 
 	const float ExpTerm = FMath::Exp(-Omega * DeltaSeconds);
@@ -2018,12 +2128,22 @@ void UGMCMotion::ApplyFacingSpring(float TargetYaw, float DeltaSeconds)
 	const float NewX = (x0 + VPlusOmegaX * DeltaSeconds) * ExpTerm;
 	const float NewV = (v0 - Omega * VPlusOmegaX * DeltaSeconds) * ExpTerm;
 
-	const float OldYaw = OverridenDesiredFacing.Yaw;
-	OverridenDesiredFacing.Yaw = FRotator::NormalizeAxis(TargetYaw + NewX);
+	const float OldYaw = FacingSpringPositionYaw;
+	FacingSpringPositionYaw = FRotator::NormalizeAxis(TargetYaw + NewX);
 	FacingSpringVelocityYaw = NewV;
 
+	// Write the smoothed yaw back to OverridenDesiredFacing for ApplyRotation to consume.
+	OverridenDesiredFacing.Yaw = FacingSpringPositionYaw;
+
+	// --- DEBUG: log spring activity during sprint ---
+	if (CurrentGait == EGMCMotion_Gait::Sprint && FMath::Abs(x0) > 5.f)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[SprintSpring] Target=%.1f Old=%.1f New=%.1f Disp=%.1f HalfLife=%.3f"),
+			TargetYaw, OldYaw, FacingSpringPositionYaw, x0, HalfLife);
+	}
+
 	// Angular velocity from actual step (for trajectory metrics / TurningStrength).
-	const float StepDeg = FMath::FindDeltaAngleDegrees(OldYaw, OverridenDesiredFacing.Yaw);
+	const float StepDeg = FMath::FindDeltaAngleDegrees(OldYaw, FacingSpringPositionYaw);
 	AngularVelocityRad = FMath::DegreesToRadians(StepDeg / DeltaSeconds);
 }
 
@@ -2047,6 +2167,19 @@ void UGMCMotion::UpdateTrajectoryMetrics()
 
 	Trj_FutureVelocity = ProjectVelocity(0.5f);
 	Trj_NearFutureVelocity = ProjectVelocity(0.1f);
+
+	// Sprint strafe reversal hold: suppress turn-related metrics so the GASP Chooser
+	// sees a decelerating character with no rotation, selecting stop/plant animations
+	// instead of pivot/redirect.
+	if (bSprintReversalHoldActive)
+	{
+		Trj_TurnAngle = 0.0f;
+		FutureFacingDelta = 0.0f;
+		Trj_IsCircling = false;
+		TurningStrength = 0.0;
+		AngularVelocityRad = 0.0f;
+		return;
+	}
 
 	// Forward-only mode (DirectionThresholdMode == 2): suppress turn-related trajectory
 	// metrics. In first person the pawn faces the camera, so velocity is always lateral
@@ -2384,6 +2517,9 @@ void UGMCMotion::UpdateGroundedFacing(float DeltaSeconds)
 	if (bTraversalWarpActive && UpdatedComponent)
 	{
 		OverridenDesiredFacing.Yaw = UpdatedComponent->GetComponentRotation().Yaw;
+		FacingSpringPositionYaw = OverridenDesiredFacing.Yaw;
+		FacingSpringVelocityYaw = 0.f;
+		bFacingSpringSettling = false;
 		return;
 	}
 
@@ -2392,16 +2528,119 @@ void UGMCMotion::UpdateGroundedFacing(float DeltaSeconds)
 	OrientationIntent = GetOrientationIntent();
 	const float IntentYaw = OrientationIntent.Rotation().Yaw;
 
-	// 2. Clamp the rotation offset so the target is always on the "closer" side to the
-	// current actor rotation. Matches the BP's Update_Grounded:
-	//   CurrentOffset = Delta(ActorRotation, TargetOrientation).Yaw
-	//   ClampedOffset = Clamp(RotationOffset, CurrentOffset - 179, CurrentOffset + 179)
-	// This prevents the pawn from rotating the "long way around" when the offset jumps.
-	const float ActorYaw = UpdatedComponent ? UpdatedComponent->GetComponentRotation().Yaw : IntentYaw;
-	const float CurrentOffset = FRotator::NormalizeAxis(ActorYaw - IntentYaw);
-	const float ClampedRotationOffset = FMath::Clamp(RotationOffset, CurrentOffset - 179.f, CurrentOffset + 179.f);
+	// 2. Compute the raw target yaw early so the reversal hold can snap to it on release.
+	const float RawTargetYaw = FRotator::NormalizeAxis(IntentYaw + RotationOffset);
 
-	// 3. Set OverridenDesiredFacing directly (no spring). ApplyRotation handles smoothing
-	// via RotateYawTowardsDirection, matching the reference project exactly.
-	OverridenDesiredFacing = FRotator(0.0, FRotator::NormalizeAxis(IntentYaw + ClampedRotationOffset), 0.0);
+	// 3. Sprint strafe reversal hold.
+	// When sprinting in aiming mode and the player reverses strafe direction, the
+	// rotation offset jumps ~180° (e.g., -90 → +90). If the spring immediately chases
+	// this new target, the capsule rotates 180° over ~0.3s, producing high angular
+	// velocity (~340°/s). This causes the GASP Chooser to select pivot/redirect
+	// animations instead of stop/plant transitions.
+	//
+	// Fix: freeze the facing spring until velocity drops, then release. The character
+	// decelerates in place (stop/plant), then the spring resumes taking the shortest arc
+	// (through 0°/camera in strafing). The offset root bone keeps the mesh forward-facing
+	// while the capsule rotates underneath with small per-frame deltas.
+	if (CurrentGait == EGMCMotion_Gait::Sprint
+		&& RotationMode == EGMCMotion_RotationMode::Aiming)
+	{
+		const FVector InputVec = GetProcessedInputVector();
+		if (!InputVec.IsNearlyZero())
+		{
+			const FVector Vel = GetLinearVelocity_GMC();
+			const FVector Accel = InputVec * GetInputAcceleration();
+			if (!Accel.IsNearlyZero() && Vel.Size2D() >= 10.f)
+			{
+				const FVector Vel2D(Vel.X, Vel.Y, 0.f);
+				const FVector Accel2D(Accel.X, Accel.Y, 0.f);
+				const float Dot = FVector::DotProduct(Vel2D.GetSafeNormal(), Accel2D.GetSafeNormal());
+				if (Dot < -0.5f && !bSprintReversalHoldActive)
+				{
+					bSprintReversalHoldActive = true;
+					UE_LOG(LogTemp, Warning, TEXT("[SprintHold] ACTIVATED Dot=%.2f Speed=%.0f Target=%.1f SpringPos=%.1f"),
+						Dot, Vel.Size2D(), RawTargetYaw, FacingSpringPositionYaw);
+				}
+			}
+		}
+	}
+
+	if (bSprintReversalHoldActive)
+	{
+		const float Speed2D = GetLinearVelocity_GMC().Size2D();
+		if (Speed2D < 50.f)
+		{
+			// Velocity has dropped enough — release the hold.
+			//
+			// Key insight: in strafing mode, the mesh faces the camera direction (IntentYaw)
+			// via the offset root bone, while the capsule is offset by RotationOffset.
+			// During a L→R reversal, the capsule was at (IntentYaw - 90°) and needs to
+			// reach (IntentYaw + 90°) — a 180° jump. If we let the spring traverse all
+			// 180°, the offset root bone may fail to fully compensate (max error ~85°),
+			// causing the mesh to visibly rotate.
+			//
+			// Fix: snap the capsule to IntentYaw (camera direction) where the mesh already
+			// is. The capsule and mesh are now aligned, so no visible change occurs. The
+			// spring then only needs to travel ~90° to reach the new target, well within
+			// the offset root bone's compensation range.
+			bSprintReversalHoldActive = false;
+			bFacingSpringSettling = true;
+
+			const float OldSpringYaw = FacingSpringPositionYaw;
+			FacingSpringPositionYaw = IntentYaw;
+			FacingSpringVelocityYaw = 0.f;
+			OverridenDesiredFacing.Yaw = IntentYaw;
+
+			UE_LOG(LogTemp, Warning, TEXT("[SprintHold] RELEASED Speed=%.0f OldSpring=%.1f SnapTo=%.1f Target=%.1f (remaining=%.1f)"),
+				Speed2D, OldSpringYaw, IntentYaw, RawTargetYaw,
+				FMath::FindDeltaAngleDegrees(IntentYaw, RawTargetYaw));
+			// Fall through — spring settling handles the ~90° transition below.
+		}
+		else
+		{
+			// Hold: keep the spring at the current position, zero out velocity state.
+			// This prevents capsule rotation and keeps AngularVelocityRad near zero,
+			// so the Chooser sees a decelerating character with no turning.
+			FacingSpringVelocityYaw = 0.f;
+			AngularVelocityRad = 0.f;
+			return;
+		}
+	}
+
+	// 4. Rotation output: spring settling or direct tracking.
+	//
+	// The facing spring (half-life 0.1s) produces smooth rotation for direction transitions
+	// but introduces steady-state tracking lag proportional to mouse speed (~72° at 500°/s).
+	// This causes the player to see their own body during fast camera rotation.
+	//
+	// Fix: only use the spring during the post-reversal-hold settling period (~90° over ~0.3s).
+	// For all other frames, set OverridenDesiredFacing directly — zero lag camera tracking.
+	if (bFacingSpringSettling)
+	{
+		const float Disp = FMath::Abs(FMath::FindDeltaAngleDegrees(RawTargetYaw, FacingSpringPositionYaw));
+		if (Disp < 3.f)
+		{
+			// Spring has converged — switch to direct tracking.
+			bFacingSpringSettling = false;
+		}
+		else
+		{
+			ApplyFacingSpring(RawTargetYaw, DeltaSeconds);
+			return;
+		}
+	}
+
+	// Direct tracking: zero-lag camera following. OverridenDesiredFacing matches the
+	// target exactly, so the capsule snaps to the correct orientation every frame.
+	// Angular velocity is computed from the per-frame change for AnimBP consumption.
+	const float PrevYaw = OverridenDesiredFacing.Yaw;
+	OverridenDesiredFacing.Yaw = RawTargetYaw;
+	FacingSpringPositionYaw = RawTargetYaw;
+	FacingSpringVelocityYaw = 0.f;
+
+	if (DeltaSeconds > UE_KINDA_SMALL_NUMBER)
+	{
+		const float StepDeg = FMath::FindDeltaAngleDegrees(PrevYaw, RawTargetYaw);
+		AngularVelocityRad = FMath::DegreesToRadians(StepDeg / DeltaSeconds);
+	}
 }

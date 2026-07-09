@@ -894,8 +894,28 @@ private:
 	// True after the rotation offset curve setup has been validated (one-time check).
 	bool bRotationOffsetCurvesValidated = false;
 
-	// Velocity state for ApplyFacingSpring (unused — kept for potential future use).
+	// Internal state for ApplyFacingSpring (called from UpdateGroundedFacing each frame).
+	// Position uses its own variable (not OverridenDesiredFacing.Yaw) so the BP's
+	// direct writes to OverridenDesiredFacing don't corrupt the spring state.
+	float FacingSpringPositionYaw = 0.f;
 	float FacingSpringVelocityYaw = 0.f;
+
+	// Sprint strafe reversal hold: freezes the facing spring so the capsule doesn't
+	// rotate 180° during the direction flip. The high angular velocity from the spring
+	// causes the GASP Chooser to select pivot animations (body rotation) instead of
+	// stop/plant transitions. By freezing the facing, angular velocity stays near zero,
+	// the Chooser sees a decelerating character and selects a stop transition. The hold
+	// releases when velocity drops below the threshold, allowing the spring to smoothly
+	// transition to the new facing direction at low speed.
+	bool bSprintReversalHoldActive = false;
+
+	// True while the facing spring is settling from a reversal hold release.
+	// During settling, ApplyFacingSpring runs normally (~90° transition over ~0.3s).
+	// Once displacement drops below threshold, this clears and the system switches
+	// to direct tracking (OverridenDesiredFacing = target, zero lag) for responsive
+	// camera following. Without this, the spring's steady-state lag (~72° at 500°/s
+	// mouse speed) causes the player to see their own body during fast rotation.
+	bool bFacingSpringSettling = false;
 
 	// GMC bind indices for GASP variables (only those owned by C++).
 	int32 BI_RotationMode = -1;
