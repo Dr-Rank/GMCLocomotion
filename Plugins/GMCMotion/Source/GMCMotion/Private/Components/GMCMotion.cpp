@@ -1426,22 +1426,35 @@ void UGMCMotion::TickComponent(float DeltaTime, ELevelTick TickType, FActorCompo
 	// The BP-bound variables DO receive correct replicated values on sim proxies, so we pull them
 	// into the C++ members here via FindPropertyByName. This runs every frame on all roles but
 	// is only needed on sim proxies — authority/autonomous already get the bridge call from BP.
+	//
+	// ReplicatedSpeed and ReplicatedLocomotionAngle are computed locally from the replicated
+	// velocity and rotation because MovementUpdate_Implementation (which computes them on
+	// server/autonomous) does not run on sim proxies and they are not GMC-bound.
 	if (IsSimulatedProxy())
 	{
+		// --- Compute locomotion values from replicated movement state ---
+		ReplicatedSpeed = GetLinearVelocity_GMC().Size2D();
+
+		const FVector Vel2D(GetLinearVelocity_GMC().X, GetLinearVelocity_GMC().Y, 0.f);
+		if (Vel2D.SizeSquared() > 1.f && UpdatedComponent)
+		{
+			const float VelYaw = Vel2D.Rotation().Yaw;
+			const float ActorYaw = UpdatedComponent->GetComponentRotation().Yaw;
+			ReplicatedLocomotionAngle = FRotator::NormalizeAxis(VelYaw - ActorYaw);
+		}
+
 		const UClass* MyClass = GetClass();
 
-		// MovementDirection (BP variable is a byte/enum)
-		if (const FProperty* Prop = MyClass->FindPropertyByName(TEXT("MovementDirection")))
+		// MovementDirection: compute locally from ReplicatedLocomotionAngle rather than
+		// reading the BP property. The BP property depends on the BP's ReplicationGraph
+		// binding it, which may not be configured. ReplicatedLocomotionAngle is already
+		// computed above from replicated velocity + rotation (always available on sim proxies).
+		// GetDirectionFromAngle handles both rotation modes naturally:
+		//   VelocityDirection: actor faces velocity → angle ≈ 0 → Forward
+		//   Aiming/Strafe: actor faces camera → angle reflects actual direction
+		if (ReplicatedSpeed > 1.f)
 		{
-			if (const FByteProperty* ByteProp = CastField<FByteProperty>(Prop))
-			{
-				MovementDirection = *ByteProp->ContainerPtrToValuePtr<uint8>(this);
-			}
-			else if (const FEnumProperty* EnumProp = CastField<FEnumProperty>(Prop))
-			{
-				const FNumericProperty* UnderlyingProp = EnumProp->GetUnderlyingProperty();
-				MovementDirection = static_cast<uint8>(UnderlyingProp->GetSignedIntPropertyValue(EnumProp->ContainerPtrToValuePtr<void>(this)));
-			}
+			MovementDirection = static_cast<uint8>(GetDirectionFromAngle(ReplicatedLocomotionAngle));
 		}
 
 		// RotationMode (BP variable is a byte/enum)
