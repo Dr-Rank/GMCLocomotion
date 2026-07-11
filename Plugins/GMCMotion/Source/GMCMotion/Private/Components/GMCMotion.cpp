@@ -1445,14 +1445,14 @@ void UGMCMotion::TickComponent(float DeltaTime, ELevelTick TickType, FActorCompo
 
 		const UClass* MyClass = GetClass();
 
-		// MovementDirection: compute locally from ReplicatedLocomotionAngle rather than
-		// reading the BP property. The BP property depends on the BP's ReplicationGraph
-		// binding it, which may not be configured. ReplicatedLocomotionAngle is already
-		// computed above from replicated velocity + rotation (always available on sim proxies).
-		// GetDirectionFromAngle handles both rotation modes naturally:
-		//   VelocityDirection: actor faces velocity → angle ≈ 0 → Forward
-		//   Aiming/Strafe: actor faces camera → angle reflects actual direction
-		if (ReplicatedSpeed > 1.f)
+		// MovementDirection: when the GASP pipeline is active, MovementDirection is GMC-bound
+		// (BindHalfByte with Periodic_Output) and receives the correct server value — which
+		// is computed from INPUT direction, not velocity-relative-to-capsule. Do NOT overwrite
+		// it here; the locally computed value is wrong in strafe/aiming mode because the capsule
+		// faces velocity (via RotationOffset), making ReplicatedLocomotionAngle ≈ 0 for all
+		// strafe directions.
+		// When GASP is disabled, fall back to the local computation for backward compatibility.
+		if (!bEnableGASPPipeline && ReplicatedSpeed > 1.f)
 		{
 			MovementDirection = static_cast<uint8>(GetDirectionFromAngle(ReplicatedLocomotionAngle));
 		}
@@ -2412,6 +2412,14 @@ FVector UGMCMotion::GetOrientationIntent() const
 				}
 			}
 		}
+		// Sim proxies have no controller — use the replicated aiming rotation.
+		FVector Forward = CachedAimingRotation.Vector();
+		Forward.Z = 0.0f;
+		if (!Forward.IsNearlyZero())
+		{
+			Forward.Normalize();
+			return Forward;
+		}
 		return FVector::ForwardVector;
 	}
 
@@ -2438,7 +2446,8 @@ FRotator UGMCMotion::GetTargetOrientation() const
 				return PC->GetControlRotation();
 			}
 		}
-		return FRotator::ZeroRotator;
+		// Sim proxies have no controller — use the replicated aiming rotation.
+		return CachedAimingRotation;
 	}
 
 	const FVector Vel = GetLinearVelocity_GMC();
