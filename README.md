@@ -46,3 +46,5 @@ GMCGASP
   ├──────────────────────┼───────────────────────────────────────────────────┤
   │ OnlineSubsystemSteam │ Steam platform support - added to local plugins   │
   └──────────────────────┴───────────────────────────────────────────────────┘
+
+REALLY IMPORTANT NOTE: If you reparent the BP_GMC_Pawn to GMC_Pawn, or create your own pawn that uses GMCMotion, you must set the Tick Group on all the meshes you use to Post Physics, otherwise you'll see some animation glitchiness.
