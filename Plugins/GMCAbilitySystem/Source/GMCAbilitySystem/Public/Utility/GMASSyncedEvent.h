@@ -3,12 +3,7 @@
 #include "CoreMinimal.h"
 #include "GameplayTags.h"
 
-// Fix for instanced struct on previous 5.5 version
-#if ENGINE_MAJOR_VERSION >=5 && ENGINE_MINOR_VERSION >= 5
-	#include "StructUtils/InstancedStruct.h"
-#else
-	#include "StructUtils/InstancedStruct.h"
-#endif
+#include "StructUtils/InstancedStruct.h"
 
 #include "GMASSyncedEvent.generated.h"
 

@@ -59,6 +59,12 @@ public:
 	void RegisterTask(int Id, UGMCAbilityTaskBase* Task) {RunningTasks.Add(Id, Task);}
 	void TickTasks(float DeltaTime);
 	void AncillaryTickTasks(float DeltaTime);
+
+	// Multi-line diagnostic snapshot of this ability and every registered task (state,
+	// completion, heartbeat counters/ages). Built for the [AbilityCut]/[TaskDiag] logs that
+	// fire when an ability dies abnormally — answers "what was still running, what had the
+	// server/client seen, and were we replaying" without needing a debugger attached.
+	FString GetAbilityCutDiagnostics() const;
 	
 	void Execute(UGMC_AbilitySystemComponent* InAbilityComponent, int InAbilityID, const UInputAction* InputAction = nullptr);
 	
@@ -68,10 +74,10 @@ public:
 	// Called by AbilityComponent from AncillaryTick (won't be rolled back on mispredictions)
 	virtual void AncillaryTick(float DeltaTime);
 	
-	UFUNCTION(BlueprintImplementableEvent, meta=(DisplayName="Tick Ability"), Category="GMCAbilitySystem|Ability")
+	UFUNCTION(BlueprintNativeEvent, meta=(DisplayName="Tick Ability"), Category="GMCAbilitySystem|Ability")
 	void TickEvent(float DeltaTime);
 
-	UFUNCTION(BlueprintImplementableEvent, meta=(DisplayName="Ancillary Tick Ability"), Category="GMCAbilitySystem|Ability")
+	UFUNCTION(BlueprintNativeEvent, meta=(DisplayName="Ancillary Tick Ability"), Category="GMCAbilitySystem|Ability")
 	void AncillaryTickEvent(float DeltaTime);
 
 	UFUNCTION(BlueprintNativeEvent, meta=(DisplayName="Ability PreExecution Check"), Category="GMCAbilitySystem|Ability")
@@ -86,7 +92,7 @@ public:
 	UFUNCTION()
 	virtual void BeginAbility();
 	
-	UFUNCTION(BlueprintImplementableEvent, meta=(DisplayName="Begin Ability", Keywords = "BeginPlay"), Category="GMCAbilitySystem|Ability")
+	UFUNCTION(BlueprintNativeEvent, meta=(DisplayName="Begin Ability", Keywords = "BeginPlay"), Category="GMCAbilitySystem|Ability")
 	void BeginAbilityEvent();
 
 	UFUNCTION(BlueprintCallable, meta=(DisplayName="End Ability"), Category="GMCAbilitySystem|Ability")
@@ -97,7 +103,7 @@ public:
 	UFUNCTION(BlueprintCallable, meta=(DisplayName="Cancel Ability"), Category="GMCAbilitySystem|Ability")
 	virtual void CancelAbility();
 
-	UFUNCTION(BlueprintImplementableEvent, meta=(DisplayName="End Ability"), Category="GMCAbilitySystem|Ability")
+	UFUNCTION(BlueprintNativeEvent, meta=(DisplayName="End Ability"), Category="GMCAbilitySystem|Ability")
 	void EndAbilityEvent();
 
 	UFUNCTION(BlueprintPure, Category="GMCAbilitySystem|Ability")
@@ -216,6 +222,19 @@ public:
 	// If those ability are active, they will prevent this ability from activating
 	FGameplayTagContainer BlockedByOtherAbility;
 
+	// Effect classes to apply when this ability ends (whether via EndAbility or CancelAbility).
+	// Each entry is applied via ApplyAbilityEffectShort using a queue type chosen at runtime:
+	// Predicted while inside a GMC tick (movement/ancillary) or Standalone, PredictedQueued
+	// otherwise. Symmetric with the existing CancelAbilityOnEnd (effects-side equivalent).
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "GMCAbilitySystem|Chain")
+	TArray<TSubclassOf<UGMCAbilityEffect>> ApplyEffectOnEnd;
+
+	// EffectTags to remove from the owner when this ability ends. Each tag matches active
+	// effects via RemoveEffectByTagSafe (NumToRemove = -1, removes all matching). Same queue
+	// type policy as ApplyEffectOnEnd.
+	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "GMCAbilitySystem|Chain", meta = (Categories = "Effect"))
+	FGameplayTagContainer RemoveEffectOnEnd;
+
 	/**
 	 * Cancels active abilities based on specific conditions.
 	 *
@@ -237,7 +256,7 @@ public:
 	 * Should be set to false for actions that should not be replayed on mispredictions. i.e. firing a weapon
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GMCAbilitySystem")
-	bool bActivateOnMovementTick = false; 
+	bool bActivateOnMovementTick = true; 
 
 	UFUNCTION()
 	void ServerConfirm();
@@ -254,7 +273,16 @@ public:
 	virtual void OnGameplayTaskInitialized(UGameplayTask& Task) override;
 	virtual void OnGameplayTaskActivated(UGameplayTask& Task) override;
 	virtual void OnGameplayTaskDeactivated(UGameplayTask& Task) override;
-	
+
+	// Returns true if the server has confirmed this ability activation.
+	bool IsServerConfirmed() const { return bServerConfirmed; }
+
+protected:
+
+	// How long to wait for server to confirm ability before cancelling on client
+	UPROPERTY(AdvancedDisplay, EditDefaultsOnly, Category="GMCAbilitySystem")
+	float ServerConfirmTimeout = 2.f;
+
 private:
 
 	void FinishEndAbility();
@@ -266,10 +294,20 @@ private:
 
 	bool bEndPending = false;
 
-	float ClientStartTime;
+	// [TaskDiag] census state (server-side diagnostics only, wall-clock): when this ability was
+	// first observed Active with no live task (0 = has live tasks / not yet observed), and a
+	// once-only latch for the stalled-ability log line. See UGMCAbility::AncillaryTick.
+	double TasklessSinceTime = 0.0;
+	bool bTasklessCensusLogged = false;
+
+	// [TaskDiag] once-per-TaskID latch for the heartbeat divergence Warning — a long-lived
+	// divergent task beats at 1/s for the rest of the ability's life; only the first beat
+	// per ID warrants a Warning + full dump.
+	TSet<int> WarnedDivergentTaskIDs;
+
+	float ClientStartTime = 0.f;
 	
-	// How long to wait for server to confirm ability before cancelling on client
-	float ServerConfirmTimeout = 1.f;
+
 
 	/** List of currently active tasks, do not modify directly */
 	UPROPERTY()
