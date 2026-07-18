@@ -52,7 +52,12 @@ UENUM(BlueprintType)
 enum class EGMCMotion_Stance : uint8
 {
 	Standing = 0,
-	Crouching = 1
+	Crouching = 1,
+	Crawling = 2,
+	Swimming = 3,
+	SwimmingIdle = 4,
+	SwimmingMoving = 5,
+	PrimalCrawl = 6
 };
 
 // GASP locomotion mode — values must match the Blueprint E_LocomotionMode asset.
@@ -97,6 +102,10 @@ struct FGASPBridgeData
 	// BP's Gait (E_Gait) → C++ CurrentGait (EGMCMotion_Gait, same byte values)
 	UPROPERTY(BlueprintReadWrite, Category = "GASP")
 	uint8 Gait = 1; // default Run (matches EGMCMotion_Gait::Run)
+
+	// BP's Stance (E_Stance) → C++ CurrentStance (EGMCMotion_Stance, same byte values)
+	UPROPERTY(BlueprintReadWrite, Category = "GASP")
+	uint8 Stance = 0; // default Standing (matches EGMCMotion_Stance::Standing)
 };
 
 /**
@@ -525,6 +534,15 @@ public:
 	float AngularVelocityRad = 0.0f;
 
 	// --- Facing spring config ---
+
+	// When true, RotationOffset is NOT added to OverridenDesiredFacing in UpdateGroundedFacing.
+	// The capsule faces pure aim direction (IntentYaw only). Enable this when weapon animation
+	// layers (e.g., SKG's Layered Blend Per Bone) replace the upper body — since LBPB discards
+	// the Orientation Warping correction applied inside BlendStack, the upper body inherits the
+	// capsule's orientation directly. Without this flag, the capsule is shifted toward movement
+	// by RotationOffset, causing the weapon/upper body to face movement direction instead of aim.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|GASP|Facing")
+	bool bDisableFacingRotationOffset = true;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|GASP|Facing")
 	float FacingSpringHalfLife = 0.1f;

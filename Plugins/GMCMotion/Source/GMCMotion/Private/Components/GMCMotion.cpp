@@ -1407,6 +1407,7 @@ void UGMCMotion::VariableToAnimBPBridge(const FGASPBridgeData& BD)
 	RotationMode = static_cast<EGMCMotion_RotationMode>(BD.RotationMode);
 	MovementDirection = BD.MovementDirection;
 	CurrentGait = static_cast<EGMCMotion_Gait>(BD.Gait);
+	CurrentStance = static_cast<EGMCMotion_Stance>(BD.Stance);
 }
 
 void UGMCMotion::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
@@ -1482,6 +1483,20 @@ void UGMCMotion::TickComponent(float DeltaTime, ELevelTick TickType, FActorCompo
 			{
 				const FNumericProperty* UnderlyingProp = EnumProp->GetUnderlyingProperty();
 				CurrentGait = static_cast<EGMCMotion_Gait>(UnderlyingProp->GetSignedIntPropertyValue(EnumProp->ContainerPtrToValuePtr<void>(this)));
+			}
+		}
+
+		// Stance (BP variable is a byte/enum — E_Stance)
+		if (const FProperty* Prop = MyClass->FindPropertyByName(TEXT("Stance")))
+		{
+			if (const FByteProperty* ByteProp = CastField<FByteProperty>(Prop))
+			{
+				CurrentStance = static_cast<EGMCMotion_Stance>(*ByteProp->ContainerPtrToValuePtr<uint8>(this));
+			}
+			else if (const FEnumProperty* EnumProp = CastField<FEnumProperty>(Prop))
+			{
+				const FNumericProperty* UnderlyingProp = EnumProp->GetUnderlyingProperty();
+				CurrentStance = static_cast<EGMCMotion_Stance>(UnderlyingProp->GetSignedIntPropertyValue(EnumProp->ContainerPtrToValuePtr<void>(this)));
 			}
 		}
 
@@ -2551,7 +2566,11 @@ void UGMCMotion::UpdateGroundedFacing(float DeltaSeconds)
 	const float IntentYaw = OrientationIntent.Rotation().Yaw;
 
 	// 2. Compute the raw target yaw early so the reversal hold can snap to it on release.
-	const float RawTargetYaw = FRotator::NormalizeAxis(IntentYaw + RotationOffset);
+	// When bDisableFacingRotationOffset is true, the capsule faces pure aim (IntentYaw)
+	// without the movement-direction shift. Required for weapon layers (SKG) that replace
+	// the OW-corrected spine via Layered Blend Per Bone.
+	const float EffectiveOffset = bDisableFacingRotationOffset ? 0.0 : RotationOffset;
+	const float RawTargetYaw = FRotator::NormalizeAxis(IntentYaw + EffectiveOffset);
 
 	// 3. Sprint strafe reversal hold.
 	// When sprinting in aiming mode and the player reverses strafe direction, the
