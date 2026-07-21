@@ -2583,8 +2583,11 @@ void UGMCMotion::UpdateGroundedFacing(float DeltaSeconds)
 	// decelerates in place (stop/plant), then the spring resumes taking the shortest arc
 	// (through 0°/camera in strafing). The offset root bone keeps the mesh forward-facing
 	// while the capsule rotates underneath with small per-frame deltas.
+	// Skip when RotationRate is 0 (first person) — the capsule tracks the camera directly
+	// each frame, so the hold just builds up a delta that snaps on release.
 	if (CurrentGait == EGMCMotion_Gait::Sprint
-		&& RotationMode == EGMCMotion_RotationMode::Aiming)
+		&& RotationMode == EGMCMotion_RotationMode::Aiming
+		&& RotationRate > 0.f)
 	{
 		const FVector InputVec = GetProcessedInputVector();
 		if (!InputVec.IsNearlyZero())
