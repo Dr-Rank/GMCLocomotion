@@ -365,18 +365,18 @@ void UGMCMotion_AnimInstance::UpdateGASPState()
 	GASPAngularVelocityRad = MovementComponent->AngularVelocityRad;
 	GASPFutureFacingDelta = MovementComponent->FutureFacingDelta;
 	bGASPIsCircling = MovementComponent->Trj_IsCircling;
+	bGASPDowned = MovementComponent->Downed;
 
 	// Periodic diagnostic log (every ~1s at 60fps).
 	static uint32 FrameCounter = 0;
 	if (++FrameCounter % 60 == 0)
 	{
 		UE_LOG(LogGMCMotion, Log,
-			TEXT("[AnimInst GASP] Pipeline=%s Dir=%d Rot=%d Gait=%d RotOffset=%.1f "
+			TEXT("[AnimInst GASP] Dir=%d Rot=%d Gait=%d RotOffset=%.1f "
 				 "InputAccel=(%.0f,%.0f,%.0f) OrientIntent=(%.2f,%.2f,%.2f) "
 				 "AimRot=(P=%.1f,Y=%.1f) DesiredFacing=(P=%.1f,Y=%.1f) "
 				 "TurnAngle=%.1f AngVelRad=%.2f FutureFacingDelta=%.1f IsCircling=%d "
 				 "Speed=%.0f GroundSpeed=%.0f LocoAngle=%.1f"),
-			MovementComponent->bEnableGASPPipeline ? TEXT("C++") : TEXT("BP"),
 			(int32)E_MovementDirection,
 			(int32)E_RotationMode,
 			(int32)E_Gait,

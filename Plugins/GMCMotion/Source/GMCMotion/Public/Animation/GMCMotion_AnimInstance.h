@@ -151,6 +151,17 @@ public:
 	FVector FloorHitImpactNormal = FVector::UpVector;
 
 	// === Distance Matching ===
+	//
+	// COMPUTED BUT CURRENTLY UNCONSUMED. Verified 2026-07-29: no graph in
+	// ABP_GMCCharacter_MoverUE5 reads any of these four, and the AnimGraph contains no
+	// distance-matching node. The AnimBP detects stops and pivots itself, from the trajectory
+	// (its own IsPivoting/MovementState functions), not from these.
+	//
+	// They are kept rather than deleted because they are exactly the inputs a Distance Matching
+	// node needs: it scrubs a stop animation's playback position by the remaining distance so the
+	// foot plants on the stop point instead of near it. If stop-planting precision ever needs to
+	// improve, wiring one of these into a distance-matching node is the mechanism — the data is
+	// already here.
 
 	UPROPERTY(BlueprintReadOnly, Category = "GMCMotion|Distance Matching")
 	bool bIsStopping = false;
@@ -237,6 +248,15 @@ public:
 
 	UPROPERTY(BlueprintReadOnly, Category = "GMCMotion|GASP|Trajectory")
 	bool bGASPIsCircling = false;
+
+	// True while the pawn is downed (crawling, awaiting revive). Cached from UGMCMotion::Downed,
+	// which is GMC-bound, so this is correct on every network role including simulated proxies.
+	//
+	// Read this from the AnimBP / chooser rather than BP_GMCMovement's own "Downed" variable:
+	// that one is BP-local gameplay state and is never written on a simulated proxy, so other
+	// players' downed pawns would keep selecting the normal crawl set.
+	UPROPERTY(BlueprintReadOnly, Category = "GMCMotion|GASP")
+	bool bGASPDowned = false;
 
 	// === GMAS Integration ===
 

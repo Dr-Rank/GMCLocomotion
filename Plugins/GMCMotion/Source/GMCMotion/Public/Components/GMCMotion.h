@@ -13,6 +13,7 @@
 #include "GameplayTagContainer.h"
 #include "GMCMotion.generated.h"
 
+class AActor;
 class UAnimMontage;
 class UCurveFloat;
 
@@ -106,6 +107,11 @@ struct FGASPBridgeData
 	// BP's Stance (E_Stance) → C++ CurrentStance (EGMCMotion_Stance, same byte values)
 	UPROPERTY(BlueprintReadWrite, Category = "GASP")
 	uint8 Stance = 0; // default Standing (matches EGMCMotion_Stance::Standing)
+
+	// BP's Downed → C++ Downed. Server-owned gameplay state (health/GMAS drives it), exposed to
+	// the AnimBP so motion matching can select the downed-crawl set instead of normal crawl.
+	UPROPERTY(BlueprintReadWrite, Category = "GASP")
+	bool Downed = false;
 };
 
 /**
@@ -339,6 +345,51 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal Warp")
 	bool bSuppressBlendOutGlide = true;
 
+	// ─── Equipment-Gated Traversal ──────────────────────────────────────────────
+	//
+	// When the game mode requires holster-before-traverse, the equipment system sets
+	// bEquipmentBlocksTraversal = true whenever a weapon is in-hand or mid-transition.
+	// ShouldBlockTraversalForEquipment() checks the flag + the exempt-montage set.
+	// The BP calls this alongside IsObstacleTooLowForTraversal in its detection logic,
+	// and PrePhysicsUpdate has a safety net that undoes a traversal start if the BP
+	// missed the check.
+
+	// Set by the equipment system. True when a weapon is in-hand or mid-transition
+	// AND the game mode requires holster before traversal.
+	UPROPERTY(BlueprintReadWrite, Category = "Traversal Warp|Equipment Gate")
+	bool bEquipmentBlocksTraversal = false;
+
+	// Set by EquipmentManager::TraversalHolster when the incoming traversal montage is
+	// in the skip-holster set. Tells the equipment gate in UpdateMovementModeDynamic to
+	// allow this traversal even though a weapon is in hand. Cleared on trailing edge
+	// (bTraversalWarpActive going true→false) so it doesn't leak to the next traversal.
+	UPROPERTY(BlueprintReadWrite, Category = "Traversal Warp|Equipment Gate")
+	bool bTraversalExemptFromEquipmentGate = false;
+
+	// Tracks previous bTraversalWarpActive for trailing-edge detection in the equipment
+	// gate. When traversal ends (true→false), the exempt flag is cleared so it doesn't
+	// leak to the next traversal attempt.
+	bool bPrevTraversalWarpActive_Gate = false;
+
+	// Traversal montages exempt from the equipment block (hurdles, short vaults that
+	// allow keeping the weapon in hand). Populated by the equipment system at BeginPlay
+	// from its own TraversalMontagesSkipHolster set.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal Warp|Equipment Gate")
+	TSet<TObjectPtr<UAnimMontage>> TraversalMontagesAllowedWithWeapon;
+
+	// Returns true if the given traversal montage should be blocked by equipment state.
+	// False = traversal allowed. True = weapon must be holstered first.
+	UFUNCTION(BlueprintPure, Category = "Traversal Warp|Equipment Gate")
+	bool ShouldBlockTraversalForEquipment(UAnimMontage* TraversalMontage = nullptr) const;
+
+	// Static version callable from any BP without needing a Cast to GMCMotion.
+	// Finds the UGMCMotion component on OwnerActor and delegates to ShouldBlockTraversalForEquipment.
+	// Returns false (allow traversal) if OwnerActor is null or has no GMCMotion component.
+	UFUNCTION(BlueprintPure, Category = "Traversal Warp|Equipment Gate", meta = (DefaultToSelf = "OwnerActor"))
+	static bool IsTraversalBlockedByEquipment(AActor* OwnerActor, UAnimMontage* TraversalMontage = nullptr);
+
+	// ─────────────────────────────────────────────────────────────────────────────
+
 	// When true, logs the per-window warp math (target, offset, half height, current vs target
 	// location) under LogGMCMotion with the "[TWarp]" prefix. Diagnostic only — no behaviour change.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal Warp")
@@ -422,9 +473,14 @@ public:
 	// CalculateRotations_CPP is still a UFUNCTION — BP calls it from its own chain,
 	// giving BP control over execution order relative to other BP-only nodes.
 	//
-	// Rotation architecture: OverridenDesiredFacing is the raw target (can jump at direction
-	// boundaries). ApplyRotation smooths via RotateYawTowardsDirection at 650°/s.
-	// The BP's ApplyFacingSpring is dead code — never called.
+	// Rotation architecture: UpdateGroundedFacing writes OverridenDesiredFacing directly to the
+	// target (zero-lag tracking). ApplyRotation then calls RotateYawTowardsDirection at
+	// RotationRate — which BP_GMCMovement sets to 0, and a rate of 0 in GMC means an INSTANT
+	// SNAP, not a rate limit. So the capsule reaches its target facing every frame, and nothing
+	// smooths it. (An earlier version of this comment claimed 650°/s; that was never the case
+	// with RotationRate at 0.)
+	// The BP's ApplyFacingSpring is disconnected from MovementUpdate; the C++ one is reachable
+	// only via the sprint reversal hold, which itself cannot run while RotationRate is 0.
 	//
 	// AnimInstance passthrough: UGMCMotion_AnimInstance::UpdateGASPState() reads all GASP
 	// variables from UGMCMotion's public UPROPERTY members. Both BP and C++ writers land
@@ -432,34 +488,21 @@ public:
 	// which side computed them.
 	// =====================================================================================
 
-	// Master switch: when true, the C++ GASP pipeline runs in PrePhysicsUpdate.
-	// When false, ALL C++ GASP calls are skipped — Blueprint drives everything.
-	// ApplyRotation reads OverridenDesiredFacing regardless and smooths via
-	// RotateYawTowardsDirection. Replication bindings remain active either way.
-	// When false (default), BP drives the entire GASP pipeline. The C++ pipeline is skipped
-	// and replication bindings are handled by the BP's ReplicationGraph instead.
-	// The AnimInstance (UGMCMotion_AnimInstance) reads from the C++ UPROPERTY members
-	// regardless — BP just needs to write to the inherited properties, not _0 variants.
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|GASP")
-	bool bEnableGASPPipeline = false;
-
-	// --- Per-function toggles for A/B testing C++ vs BP ---
-	// When false, the C++ version is skipped and the BP version should drive.
-	// Only checked when bEnableGASPPipeline is true.
+	// The GASP pipeline is always on.
 	//
-	// CalculateRotations and MovementDirection are BP-driven by default (false):
-	//   BP calls CalculateRotations_CPP from its PrePhysicsUpdate chain, and
-	//   BP's GetMovementDirectionAndOffset handles direction + offset.
-	//   The C++ pipeline does NOT call these — BP controls their execution order.
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|GASP|Debug")
-	bool bCPP_GroundedFacing = true;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|GASP|Debug")
-	bool bCPP_InputAcceleration = true;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|GASP|Debug")
-	bool bCPP_TrajectoryMetrics = true;
+	// It used to be switchable via bEnableGASPPipeline, with per-function bCPP_* toggles for
+	// A/B testing C++ against BP during the migration. Both are gone, for a correctness reason
+	// rather than tidiness: bEnableGASPPipeline also gated the whole body of
+	// BindReplicationData_Implementation, and GMC bind registration defines the network channel
+	// layout. Because the flag was EditAnywhere it could differ between pawn types (the CDO read
+	// false while BP_GMC_Pawn's component instance overrode it to true), and because it was
+	// BlueprintReadWrite it could be flipped at runtime — after bindings had already registered.
+	// Either way the client and server binding layouts diverge, and that does not fail loudly;
+	// it silently corrupts replication.
+	//
+	// CalculateRotations_CPP and MovementDirection remain BP-driven: BP calls
+	// CalculateRotations_CPP from its own PrePhysicsUpdate chain, and BP's
+	// GetMovementDirectionAndOffset owns direction + rotation offset.
 
 	// =====================================================================================
 	//  GASP State — replicated via GMC bind system
@@ -477,6 +520,19 @@ public:
 	// No UPROPERTY — hidden from BP. Byte values match E_MovementDirection: F=0, B=1, LR=2, LL=3, RL=4, RR=5.
 	uint8 MovementDirection = 0;
 
+	// --- Bridge members (Tools/manage_bridge_variables.py inserts below this line) ---
+
+	// True while the pawn is in the downed (crawling, awaiting revive) state.
+	//
+	// Written from BP via VariableToAnimBPBridge → FGASPBridgeData on authority/autonomous, and
+	// GMC-bound below (BI_Downed) so simulated proxies receive it too. When the GASP pipeline is
+	// off there is no binding, and TickComponent falls back to reading BP's own "Downed" instead.
+	//
+	// NO UPROPERTY, and that is load-bearing: BP_GMCMovement already owns a bool named "Downed".
+	// Adding a UPROPERTY of the same name here would rename the BP's variable to "Downed_0" and
+	// silently detach every existing BP node that reads or writes it.
+	bool Downed = false;
+
 	UPROPERTY(BlueprintReadWrite, Category = "GMCMotion|GASP|Input")
 	bool WantsToTraverse = false;
 
@@ -491,7 +547,8 @@ public:
 	FRotator CachedAimingRotation = FRotator::ZeroRotator;
 
 	// Rotation offset from the direction-specific curve evaluation (replicated).
-	// Written by UpdateMovementDirection(), consumed by UpdateGroundedFacing().
+	// Written by BP's GetMovementDirectionAndOffset, consumed by UpdateGroundedFacing() —
+	// though only when bDisableFacingRotationOffset is false, which it is not by default.
 	UPROPERTY(BlueprintReadWrite, Category = "GMCMotion|GASP")
 	double RotationOffset = 0.0;
 
@@ -587,8 +644,45 @@ public:
 	UPROPERTY(BlueprintReadOnly, Category = "GMCMotion|Locomotion")
 	FVector LastLandingVelocity = FVector::ZeroVector;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Locomotion")
-	float SprintSpeedThreshold = 600.0f;
+	// --- Sprint forward cone ---
+	//
+	// Sprint animation coverage is a forward cone only. Stop/plant animations exist for
+	// F/FL/FR at sprint, against all ten directions (F FL FR L R B BL BR + lateral variants) at
+	// walk and run. Allowing sprint outside that cone asks the chooser for animations that do not
+	// exist: it returns no valid anim, the transition state blends straight through to the loop,
+	// and motion matching falls back to whatever is nearest — which reads as the feet failing to
+	// plant and snapping between directions.
+	//
+	// CanSprintInCurrentDirection() reports whether the pawn's movement intent lies inside the
+	// cone. Gait selection should refuse Sprint when it returns false, dropping to Run — which has
+	// full directional coverage and plants correctly. Gait drives speed, so the pawn also slows to
+	// RunSpeed rather than running run animations at sprint speed.
+
+	// Master switch for the forward-cone restriction. Turn OFF only if your animation set has
+	// strafe sprint coverage; with the stock GASP set it must stay ON.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Locomotion|Sprint",
+		meta = (ToolTip = "Restrict sprinting to a forward cone.\n\nNOTE: GASP does not natively include strafe sprint anims - sprint stops exist only for F/FL/FR, while walk and run have all ten directions. Keep this ON if you are using those, otherwise sprinting sideways asks the chooser for animations that do not exist: it returns no valid anim, the transition state blends straight through, and the feet fail to plant and snap between directions.\n\nTurn OFF only once your set includes lateral and rear sprint coverage."))
+	bool bRestrictSprintToForwardCone = true;
+
+	// Half-angle (degrees) between input direction and orientation intent within which sprint is
+	// permitted. Roughly matches the FL..FR spread of the authored sprint set.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Locomotion|Sprint", meta = (ClampMin = "0.0", ClampMax = "180.0"))
+	float SprintForwardConeAngle = 50.f;
+
+	// Extra tolerance (degrees) applied while already sprinting, so hovering exactly on the cone
+	// boundary cannot flip the gait every frame. Gait flapping is itself an animation-selection
+	// bug, so this is deliberately not zero.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Locomotion|Sprint", meta = (ClampMin = "0.0", ClampMax = "90.0"))
+	float SprintForwardConeHysteresis = 15.f;
+
+	// True when movement intent is inside the sprint cone. Call this from gait selection and
+	// refuse Sprint when it is false.
+	//
+	// Returns true when there is no movement input, so starting a sprint from standing is never
+	// blocked. In VelocityDirection mode the pawn turns to face its input, so OrientationIntent
+	// tracks the input and this naturally always passes — the cone only constrains strafing.
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "GMCMotion|Locomotion|Sprint")
+	bool CanSprintInCurrentDirection() const;
 
 	// Enable distance matching predictions (stop/pivot). When false, IsStopPredicted
 	// and IsPivotPredicted always return false (saves the per-frame kinematic math).
@@ -707,10 +801,14 @@ public:
 
 	// --- ApplyFacingSpring (UNUSED) ---
 	//
-	// Critically-damped yaw spring. NOT called — the reference project's ApplyFacingSpring
-	// is dead code too. Rotation smoothing is handled by RotateYawTowardsDirection in
-	// ApplyRotation, and direction continuity comes from the RotationOffset curves.
-	// Kept for potential future use.
+	// Critically-damped yaw spring.
+	//
+	// There IS a call site — UpdateGroundedFacing calls this during the post-reversal settling
+	// window. But that window is entered only when the sprint reversal hold releases, and the
+	// hold requires RotationRate > 0 while BP_GMCMovement sets it to 0. So in the current
+	// configuration this is unreachable in practice, though not dead by inspection.
+	// (An earlier comment here stated it was never called, which sent a debugging session
+	// looking in the wrong place — the call at UpdateGroundedFacing is real.)
 	void ApplyFacingSpring(float TargetYaw, float DeltaSeconds);
 
 	// --- DEFERRED: UpdateTrajectoryMetrics ---
@@ -733,12 +831,6 @@ public:
 	// Deferred to embedding phase with the rest of the MovementUpdate chain.
 	UFUNCTION(BlueprintCallable, Category = "GMCMotion|GASP")
 	void UpdateTrajectoryMetrics();
-
-	// C++ version of direction quantization + rotation offset curve evaluation.
-	// NOT called from the C++ pipeline — BP's GetMovementDirectionAndOffset drives
-	// MovementDirection and RotationOffset instead (C++ version caused hitching).
-	// Kept for reference / future use.
-	void UpdateMovementDirection();
 
 	// Maps WantsToStrafe → RotationMode (Aiming / VelocityDirection).
 	// _CPP suffix avoids name conflict with the BP's own UpdateRotationMode function.
@@ -886,12 +978,6 @@ protected:
 	FVector ComputeRootMinusBoneOffset(UAnimMontage* Montage, float Time, FName BoneName) const;
 
 private:
-	// Returns the movement direction for the given locomotion angle based on DirectionThresholdMode and RotationMode.
-	EGMCMotion_MovementDirection GetDirectionFromAngle(float Angle) const;
-
-	// Returns the rotation offset curve asset for the given direction.
-	UCurveFloat* GetRotationOffsetCurveForDirection(EGMCMotion_MovementDirection Dir) const;
-
 	// True after the first GASP pipeline tick initializes OverridenDesiredFacing
 	// from the actor's current rotation. Prevents a snap to world-forward on spawn.
 	bool bFacingInitialized = false;
@@ -911,6 +997,10 @@ private:
 
 	// True after the rotation offset curve setup has been validated (one-time check).
 	bool bRotationOffsetCurvesValidated = false;
+
+	// Hysteresis latch for CanSprintInCurrentDirection(). Mutable because the query is const and
+	// BlueprintPure; it is idempotent for a given input, so repeated calls in one frame agree.
+	mutable bool bSprintConeLatched = false;
 
 	// Internal state for ApplyFacingSpring (called from UpdateGroundedFacing each frame).
 	// Position uses its own variable (not OverridenDesiredFacing.Yaw) so the BP's
@@ -952,4 +1042,5 @@ private:
 	int32 BI_Trj_NearFutureVelocity = -1;
 	int32 BI_Trj_TurnAngle = -1;
 	int32 BI_AngularVelocityRad = -1;
+	int32 BI_Downed = -1;
 };

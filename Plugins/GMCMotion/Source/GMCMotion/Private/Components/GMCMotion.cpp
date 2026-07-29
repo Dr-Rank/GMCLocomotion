@@ -47,6 +47,55 @@ bool UGMCMotion::UpdateMovementModeDynamic_Implementation(FGMC_FloorParams& Floo
 
 	if (bTraversalWarpActive)
 	{
+		// ─── Equipment gate ─────────────────────────────────────────────────────
+		// When bEquipmentBlocksTraversal is true (weapon in hand, game mode requires holster),
+		// block the traversal unless bTraversalExemptFromEquipmentGate was set by
+		// TraversalHolster (montage is in the skip-holster set, e.g. hurdles/vaults).
+		//
+		// TraversalHolster runs during PrePhysicsUpdate (via BP), which GMC guarantees
+		// executes BEFORE UpdateMovementModeDynamic. The exempt flag is therefore
+		// already set correctly for this frame by the time we read it here.
+		//
+		// NOTE: We do NOT try to identify the active montage here. On the first frame
+		// where bTraversalWarpActive is true, the traversal montage is often not yet in
+		// the montage tracker, and GetCurrentActiveMontage() can return a weapon hold/idle
+		// montage — which would incorrectly override the exempt flag to false.
+		if (bEquipmentBlocksTraversal && !bTraversalExemptFromEquipmentGate)
+		{
+			UE_LOG(LogGMCMotion, Warning,
+				TEXT("[TWarp] Equipment gate BLOCKED traversal. Weapon must be holstered first."));
+
+			bTraversalWarpActive = false;
+			bTraversalExemptFromEquipmentGate = false;
+			WantsToTraverse = false;
+
+			// Stop any traversal montage that may have started
+			if (SkeletalMesh)
+			{
+				if (UAnimMontage* ActiveMontage = GetActiveRootMotionMontage(MontageTracker))
+				{
+					StopMontage(SkeletalMesh, MontageTracker, 0.15f);
+				}
+			}
+
+			WarpFrontLedge = FVector::ZeroVector;
+			WarpBackLedge = FVector::ZeroVector;
+			WarpBackFloor = FVector::ZeroVector;
+			WarpFrontLedgeNormal = FVector::ZeroVector;
+
+			bPrevTraversalWarpActive_Gate = false;
+			return Super::UpdateMovementModeDynamic_Implementation(Floor, DeltaSeconds);
+		}
+
+		// Log on first frame of an exempt traversal (diagnostic)
+		if (bEquipmentBlocksTraversal && bTraversalExemptFromEquipmentGate && !bPrevTraversalWarpActive_Gate)
+		{
+			UE_LOG(LogGMCMotion, Warning,
+				TEXT("[TWarp] Equipment gate PASSED — traversal exempt (skip-holster montage)."));
+		}
+
+		bPrevTraversalWarpActive_Gate = true;
+
 		// Force Custom1 (TraversalMovementMode) for ALL traversals — both reach and jump-over.
 		// PhysicsCustom routes through MoveThroughAirNoLanding which sets bSweep=false during the warp,
 		// preventing PhysicsGrounded from stripping Z (floor projection) or PhysicsAirborne from
@@ -67,6 +116,18 @@ bool UGMCMotion::UpdateMovementModeDynamic_Implementation(FGMC_FloorParams& Floo
 			SetMovementMode(TraversalMovementMode);
 		}
 		return true;
+	}
+
+	// Trailing edge: traversal just ended (bTraversalWarpActive went true→false).
+	// Clear the exempt flag so it doesn't leak to the next traversal attempt.
+	// Safe because TraversalHolster (which SETS the flag) runs during PrePhysicsUpdate,
+	// which executes BEFORE UpdateMovementModeDynamic. A new traversal's exempt flag is
+	// always set before the gate reads it; this trailing-edge clear only affects flags
+	// from completed traversals.
+	if (bPrevTraversalWarpActive_Gate)
+	{
+		bTraversalExemptFromEquipmentGate = false;
+		bPrevTraversalWarpActive_Gate = false;
 	}
 
 	return Super::UpdateMovementModeDynamic_Implementation(Floor, DeltaSeconds);
@@ -1322,7 +1383,10 @@ bool UGMCMotion::GetTargetByName(FName Name, FVector& OutTarget) const
 
 void UGMCMotion::PrePhysicsUpdate_Implementation(float DeltaSeconds)
 {
-	// Let the BP pipeline run first (Jump, UpdateGait, SetGait, Update_Grounded_Physic, traversal).
+	// Let the BP pipeline run (Jump, UpdateGait, SetGait, Update_Grounded_Physic, traversal).
+	// Equipment gate is handled in UpdateMovementModeDynamic (catches bTraversalWarpActive
+	// regardless of when/where it's set). TraversalHolster flags exempt traversals via
+	// bTraversalExemptFromEquipmentGate on UGMCMotion.
 	Super::PrePhysicsUpdate_Implementation(DeltaSeconds);
 
 	// Initialize OverridenDesiredFacing from the actor's current rotation on the first tick,
@@ -1335,7 +1399,7 @@ void UGMCMotion::PrePhysicsUpdate_Implementation(float DeltaSeconds)
 	}
 
 	// One-time validation: warn if rotation offset curves are not assigned.
-	if (bEnableGASPPipeline && !bRotationOffsetCurvesValidated)
+	if (!bRotationOffsetCurvesValidated)
 	{
 		bRotationOffsetCurvesValidated = true;
 
@@ -1384,18 +1448,12 @@ void UGMCMotion::PrePhysicsUpdate_Implementation(float DeltaSeconds)
 	}
 
 	// GASP pipeline — runs after the BP's PrePhysicsUpdate event completes.
-	// Only functions that tested well in C++ are called here. CalculateRotations_CPP
-	// and MovementDirection remain BP-driven (BP calls CalculateRotations_CPP as a UFUNCTION;
-	// BP's GetMovementDirectionAndOffset handles direction + offset).
-	if (bEnableGASPPipeline)
-	{
-		if (bCPP_InputAcceleration) UpdateInputAcceleration();
-		UpdateRotationMode_CPP();
-		// CalculateRotations_CPP: called from BP's PrePhysicsUpdate chain (not here)
-		// MovementDirection: driven by BP's GetMovementDirectionAndOffset (not here)
-		if (bCPP_GroundedFacing) UpdateGroundedFacing(DeltaSeconds);
-		if (bCPP_TrajectoryMetrics) UpdateTrajectoryMetrics();
-	}
+	// CalculateRotations_CPP is called from BP's own PrePhysicsUpdate chain, and movement
+	// direction is owned by BP's GetMovementDirectionAndOffset — neither is called here.
+	UpdateInputAcceleration();
+	UpdateRotationMode_CPP();
+	UpdateGroundedFacing(DeltaSeconds);
+	UpdateTrajectoryMetrics();
 }
 
 void UGMCMotion::VariableToAnimBPBridge(const FGASPBridgeData& BD)
@@ -1408,6 +1466,7 @@ void UGMCMotion::VariableToAnimBPBridge(const FGASPBridgeData& BD)
 	MovementDirection = BD.MovementDirection;
 	CurrentGait = static_cast<EGMCMotion_Gait>(BD.Gait);
 	CurrentStance = static_cast<EGMCMotion_Stance>(BD.Stance);
+	Downed = BD.Downed;
 }
 
 void UGMCMotion::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
@@ -1446,17 +1505,11 @@ void UGMCMotion::TickComponent(float DeltaTime, ELevelTick TickType, FActorCompo
 
 		const UClass* MyClass = GetClass();
 
-		// MovementDirection: when the GASP pipeline is active, MovementDirection is GMC-bound
-		// (BindHalfByte with Periodic_Output) and receives the correct server value — which
-		// is computed from INPUT direction, not velocity-relative-to-capsule. Do NOT overwrite
-		// it here; the locally computed value is wrong in strafe/aiming mode because the capsule
-		// faces velocity (via RotationOffset), making ReplicatedLocomotionAngle ≈ 0 for all
-		// strafe directions.
-		// When GASP is disabled, fall back to the local computation for backward compatibility.
-		if (!bEnableGASPPipeline && ReplicatedSpeed > 1.f)
-		{
-			MovementDirection = static_cast<uint8>(GetDirectionFromAngle(ReplicatedLocomotionAngle));
-		}
+		// MovementDirection is deliberately NOT recomputed here. It is GMC-bound (BindHalfByte,
+		// Periodic_Output) and the replicated server value is computed from INPUT direction, not
+		// velocity relative to the capsule. Recomputing locally is wrong in strafe/aiming mode:
+		// the capsule faces velocity via RotationOffset, so ReplicatedLocomotionAngle is ~0 for
+		// every strafe direction and they all collapse to Forward.
 
 		// RotationMode (BP variable is a byte/enum)
 		if (const FProperty* Prop = MyClass->FindPropertyByName(TEXT("RotationMode")))
@@ -1499,6 +1552,12 @@ void UGMCMotion::TickComponent(float DeltaTime, ELevelTick TickType, FActorCompo
 				CurrentStance = static_cast<EGMCMotion_Stance>(UnderlyingProp->GetSignedIntPropertyValue(EnumProp->ContainerPtrToValuePtr<void>(this)));
 			}
 		}
+
+		// Downed is deliberately NOT read from the BP variable here, unlike its neighbours.
+		// It is GMC-bound in C++ (BI_Downed), so a simulated proxy already holds the correct
+		// replicated value. Copying BP's own "Downed" over it would replace a good value with
+		// the BP-local one, which is never written on a sim proxy and so reads false forever.
+		// Same reasoning as the MovementDirection note above.
 
 		// TurningStrength (BP name: TurningStrenght — note the typo matches the BP)
 		if (const FProperty* Prop = MyClass->FindPropertyByName(TEXT("TurningStrenght")))
@@ -1594,35 +1653,18 @@ void UGMCMotion::ApplyRotation(bool bIsDirectBotMove, const FGMC_RootMotionVeloc
 		return;
 	}
 
-	// Rate-limited rotation toward OverridenDesiredFacing.
-	// UpdateGroundedFacing feeds the raw target into ApplyFacingSpring, which smoothly
-	// moves OverridenDesiredFacing via a critically-damped spring. This function then
-	// rotates the actor toward the smoothed target via RotateYawTowardsDirection.
+	// Rotation toward OverridenDesiredFacing at RotationRate.
+	//
+	// NOTE: UpdateGroundedFacing writes OverridenDesiredFacing DIRECTLY to the target (zero-lag
+	// tracking); the facing spring only runs during the post-reversal settling window, which is
+	// itself unreachable while RotationRate is 0. And a RotationRate of 0 means RotateYawTowards-
+	// Direction snaps instantly rather than rate-limiting — so despite the name, this is currently
+	// an instant snap, not a smoothed rotation.
 	const float YawBefore = UpdatedComponent ? UpdatedComponent->GetComponentRotation().Yaw : 0.f;
 
 	const FVector FacingDirection = OverridenDesiredFacing.Vector();
 	if (!FacingDirection.IsNearlyZero())
 	{
-		// --- DEBUG: log rotation state and mesh yaw during sprint ---
-		if (CurrentGait == EGMCMotion_Gait::Sprint && UpdatedComponent)
-		{
-			const float DbgDelta = FMath::FindDeltaAngleDegrees(YawBefore, OverridenDesiredFacing.Yaw);
-			if (FMath::Abs(DbgDelta) > 5.f)
-			{
-				float MeshYaw = 0.f;
-				if (SkeletalMesh)
-				{
-					MeshYaw = SkeletalMesh->GetComponentRotation().Yaw;
-				}
-				const float MeshCapsuleDelta = FMath::FindDeltaAngleDegrees(YawBefore, MeshYaw);
-				UE_LOG(LogTemp, Warning,
-					TEXT("[SprintRot] CapsuleYaw=%.1f FacingYaw=%.1f Delta=%.1f MeshYaw=%.1f MeshOffset=%.1f Speed=%.0f"),
-					YawBefore, OverridenDesiredFacing.Yaw, DbgDelta,
-					MeshYaw, MeshCapsuleDelta,
-					GetLinearVelocity_GMC().Size2D());
-			}
-		}
-
 		if (bUseSafeRotations)
 		{
 			RotateYawTowardsDirectionSafe(FacingDirection, RotationRate, SafeRotationCollisionTolerance, DeltaSeconds);
@@ -1634,21 +1676,11 @@ void UGMCMotion::ApplyRotation(bool bIsDirectBotMove, const FGMC_RootMotionVeloc
 	}
 
 	// Compute angular velocity from actual rotation step (for trajectory metrics & anim).
-	if (bEnableGASPPipeline && UpdatedComponent && DeltaSeconds > UE_KINDA_SMALL_NUMBER)
+	if (UpdatedComponent && DeltaSeconds > UE_KINDA_SMALL_NUMBER)
 	{
 		const float YawAfter = UpdatedComponent->GetComponentRotation().Yaw;
 		const float StepDeg = FMath::FindDeltaAngleDegrees(YawBefore, YawAfter);
 		AngularVelocityRad = FMath::DegreesToRadians(StepDeg / DeltaSeconds);
-
-		// --- DEBUG: log mesh vs capsule after rotation during sprint transitions ---
-		if (CurrentGait == EGMCMotion_Gait::Sprint && FMath::Abs(StepDeg) > 5.f && SkeletalMesh)
-		{
-			const float MeshYawPost = SkeletalMesh->GetComponentRotation().Yaw;
-			const float OffsetRootBoneEst = FMath::FindDeltaAngleDegrees(YawAfter, MeshYawPost);
-			UE_LOG(LogTemp, Warning,
-				TEXT("[SprintMesh] CapsuleStep=%.1f CapsuleNow=%.1f MeshNow=%.1f OffsetRootBone~=%.1f"),
-				StepDeg, YawAfter, MeshYawPost, OffsetRootBoneEst);
-		}
 	}
 }
 
@@ -1663,145 +1695,165 @@ void UGMCMotion::BindReplicationData_Implementation()
 	// Gait, Stance, WantsToSprint, WantsToCrouch, WantsToJump
 	// are bound in Blueprint (BP_GMCMovement). Only C++-owned variables are bound here.
 	//
-	// When bEnableGASPPipeline is false, skip ALL GASP bindings — the reference BP's
-	// ReplicationGraph binds these same variables (and its own _0 variants). Double-binding
-	// the same UPROPERTY crashes or silently corrupts the replication state.
-	if (bEnableGASPPipeline)
-	{
-		BI_RotationMode = BindHalfByte(
-			reinterpret_cast<uint8&>(RotationMode),
-			EGMC_PredictionMode::ClientAuth_Input,
-			EGMC_CombineMode::CombineIfUnchanged,
-			EGMC_SimulationMode::PeriodicAndOnChange_Output,
-			EGMC_InterpolationFunction::NearestNeighbour
-		);
+	// These bindings are unconditional. They used to sit inside "if (bEnableGASPPipeline)" so the
+	// reference BP's ReplicationGraph could bind the same variables instead — double-binding the
+	// same UPROPERTY crashes or silently corrupts replication state. That toggle is gone: bind
+	// registration defines the network channel layout, so it must never depend on an EditAnywhere
+	// per-instance bool that two pawn types can disagree about.
+	BI_RotationMode = BindHalfByte(
+		reinterpret_cast<uint8&>(RotationMode),
+		EGMC_PredictionMode::ClientAuth_Input,
+		EGMC_CombineMode::CombineIfUnchanged,
+		EGMC_SimulationMode::PeriodicAndOnChange_Output,
+		EGMC_InterpolationFunction::NearestNeighbour
+	);
 
-		BI_MovementDirection = BindHalfByte(
-			MovementDirection,
-			EGMC_PredictionMode::ServerAuth_Output_ClientValidated,
-			EGMC_CombineMode::AlwaysCombine,
-			EGMC_SimulationMode::Periodic_Output,
-			EGMC_InterpolationFunction::NearestNeighbour
-		);
+	BI_MovementDirection = BindHalfByte(
+		MovementDirection,
+		EGMC_PredictionMode::ServerAuth_Output_ClientValidated,
+		EGMC_CombineMode::AlwaysCombine,
+		EGMC_SimulationMode::Periodic_Output,
+		EGMC_InterpolationFunction::NearestNeighbour
+	);
 
-		BI_WantsToTraverse = BindBool(
-			WantsToTraverse,
-			EGMC_PredictionMode::ClientAuth_Input,
-			EGMC_CombineMode::CombineIfUnchanged,
-			EGMC_SimulationMode::PeriodicAndOnChange_Output,
-			EGMC_InterpolationFunction::NearestNeighbour
-		);
+	BI_WantsToTraverse = BindBool(
+		WantsToTraverse,
+		EGMC_PredictionMode::ClientAuth_Input,
+		EGMC_CombineMode::CombineIfUnchanged,
+		EGMC_SimulationMode::PeriodicAndOnChange_Output,
+		EGMC_InterpolationFunction::NearestNeighbour
+	);
 
-		// --- Trajectory predictor data ---
+	// --- Trajectory predictor data ---
 
-		BI_CustomComputeInputAcceleration = BindCompressedVector(
-			CustomComputeInputAcceleration,
-			EGMC_PredictionMode::ClientAuth_Input,
-			EGMC_CombineMode::CombineIfUnchanged,
-			EGMC_SimulationMode::PeriodicAndOnChange_Output,
-			EGMC_InterpolationFunction::Linear
-		);
+	BI_CustomComputeInputAcceleration = BindCompressedVector(
+		CustomComputeInputAcceleration,
+		EGMC_PredictionMode::ClientAuth_Input,
+		EGMC_CombineMode::CombineIfUnchanged,
+		EGMC_SimulationMode::PeriodicAndOnChange_Output,
+		EGMC_InterpolationFunction::Linear
+	);
 
-		BI_OrientationIntent = BindCompressedVector(
-			OrientationIntent,
-			EGMC_PredictionMode::ClientAuth_Input,
-			EGMC_CombineMode::CombineIfUnchanged,
-			EGMC_SimulationMode::PeriodicAndOnChange_Output,
-			EGMC_InterpolationFunction::Linear
-		);
+	BI_OrientationIntent = BindCompressedVector(
+		OrientationIntent,
+		EGMC_PredictionMode::ClientAuth_Input,
+		EGMC_CombineMode::CombineIfUnchanged,
+		EGMC_SimulationMode::PeriodicAndOnChange_Output,
+		EGMC_InterpolationFunction::Linear
+	);
 
-		BI_OverridenDesiredFacing = BindCompressedRotator(
-			OverridenDesiredFacing,
-			EGMC_PredictionMode::ClientAuth_Input,
-			EGMC_CombineMode::CombineIfUnchanged,
-			EGMC_SimulationMode::PeriodicAndOnChange_Output,
-			EGMC_InterpolationFunction::Linear
-		);
+	BI_OverridenDesiredFacing = BindCompressedRotator(
+		OverridenDesiredFacing,
+		EGMC_PredictionMode::ClientAuth_Input,
+		EGMC_CombineMode::CombineIfUnchanged,
+		EGMC_SimulationMode::PeriodicAndOnChange_Output,
+		EGMC_InterpolationFunction::Linear
+	);
 
-		// --- Trajectory metrics ---
+	// --- Trajectory metrics ---
 
-		BI_Trj_FutureVelocity = BindCompressedVector(
-			Trj_FutureVelocity,
-			EGMC_PredictionMode::ClientAuth_Input,
-			EGMC_CombineMode::CombineIfUnchanged,
-			EGMC_SimulationMode::PeriodicAndOnChange_Output,
-			EGMC_InterpolationFunction::Linear
-		);
+	BI_Trj_FutureVelocity = BindCompressedVector(
+		Trj_FutureVelocity,
+		EGMC_PredictionMode::ClientAuth_Input,
+		EGMC_CombineMode::CombineIfUnchanged,
+		EGMC_SimulationMode::PeriodicAndOnChange_Output,
+		EGMC_InterpolationFunction::Linear
+	);
 
-		BI_Trj_NearFutureVelocity = BindCompressedVector(
-			Trj_NearFutureVelocity,
-			EGMC_PredictionMode::ClientAuth_Input,
-			EGMC_CombineMode::CombineIfUnchanged,
-			EGMC_SimulationMode::PeriodicAndOnChange_Output,
-			EGMC_InterpolationFunction::Linear
-		);
+	BI_Trj_NearFutureVelocity = BindCompressedVector(
+		Trj_NearFutureVelocity,
+		EGMC_PredictionMode::ClientAuth_Input,
+		EGMC_CombineMode::CombineIfUnchanged,
+		EGMC_SimulationMode::PeriodicAndOnChange_Output,
+		EGMC_InterpolationFunction::Linear
+	);
 
-		BI_Trj_TurnAngle = BindSinglePrecisionFloat(
-			Trj_TurnAngle,
-			EGMC_PredictionMode::ClientAuth_Input,
-			EGMC_CombineMode::CombineIfUnchanged,
-			EGMC_SimulationMode::PeriodicAndOnChange_Output,
-			EGMC_InterpolationFunction::Linear
-		);
+	BI_Trj_TurnAngle = BindSinglePrecisionFloat(
+		Trj_TurnAngle,
+		EGMC_PredictionMode::ClientAuth_Input,
+		EGMC_CombineMode::CombineIfUnchanged,
+		EGMC_SimulationMode::PeriodicAndOnChange_Output,
+		EGMC_InterpolationFunction::Linear
+	);
 
-		BI_AngularVelocityRad = BindSinglePrecisionFloat(
-			AngularVelocityRad,
-			EGMC_PredictionMode::ClientAuth_Input,
-			EGMC_CombineMode::CombineIfUnchanged,
-			EGMC_SimulationMode::PeriodicAndOnChange_Output,
-			EGMC_InterpolationFunction::Linear
-		);
+	BI_AngularVelocityRad = BindSinglePrecisionFloat(
+		AngularVelocityRad,
+		EGMC_PredictionMode::ClientAuth_Input,
+		EGMC_CombineMode::CombineIfUnchanged,
+		EGMC_SimulationMode::PeriodicAndOnChange_Output,
+		EGMC_InterpolationFunction::Linear
+	);
 
-		// --- New pipeline variables (migrated from BP) ---
+	// --- New pipeline variables (migrated from BP) ---
 
-		BI_WantsToStrafe = BindBool(
-			WantsToStrafe,
-			EGMC_PredictionMode::ClientAuth_Input,
-			EGMC_CombineMode::CombineIfUnchanged,
-			EGMC_SimulationMode::PeriodicAndOnChange_Output,
-			EGMC_InterpolationFunction::NearestNeighbour
-		);
+	BI_WantsToStrafe = BindBool(
+		WantsToStrafe,
+		EGMC_PredictionMode::ClientAuth_Input,
+		EGMC_CombineMode::CombineIfUnchanged,
+		EGMC_SimulationMode::PeriodicAndOnChange_Output,
+		EGMC_InterpolationFunction::NearestNeighbour
+	);
 
-		BI_CachedAimingRotation = BindCompressedRotator(
-			CachedAimingRotation,
-			EGMC_PredictionMode::ClientAuth_Input,
-			EGMC_CombineMode::CombineIfUnchanged,
-			EGMC_SimulationMode::PeriodicAndOnChange_Output,
-			EGMC_InterpolationFunction::Linear
-		);
+	BI_CachedAimingRotation = BindCompressedRotator(
+		CachedAimingRotation,
+		EGMC_PredictionMode::ClientAuth_Input,
+		EGMC_CombineMode::CombineIfUnchanged,
+		EGMC_SimulationMode::PeriodicAndOnChange_Output,
+		EGMC_InterpolationFunction::Linear
+	);
 
-		BI_RotationOffset = BindDoublePrecisionFloat(
-			RotationOffset,
-			EGMC_PredictionMode::ClientAuth_Input,
-			EGMC_CombineMode::CombineIfUnchanged,
-			EGMC_SimulationMode::PeriodicAndOnChange_Output,
-			EGMC_InterpolationFunction::Linear
-		);
+	BI_RotationOffset = BindDoublePrecisionFloat(
+		RotationOffset,
+		EGMC_PredictionMode::ClientAuth_Input,
+		EGMC_CombineMode::CombineIfUnchanged,
+		EGMC_SimulationMode::PeriodicAndOnChange_Output,
+		EGMC_InterpolationFunction::Linear
+	);
 
-		BI_FutureFacingDelta = BindCompressedSinglePrecisionFloat(
-			FutureFacingDelta,
-			EGMC_PredictionMode::ClientAuth_Input,
-			EGMC_CombineMode::CombineIfUnchanged,
-			EGMC_SimulationMode::PeriodicAndOnChange_Output,
-			EGMC_InterpolationFunction::Linear
-		);
+	BI_FutureFacingDelta = BindCompressedSinglePrecisionFloat(
+		FutureFacingDelta,
+		EGMC_PredictionMode::ClientAuth_Input,
+		EGMC_CombineMode::CombineIfUnchanged,
+		EGMC_SimulationMode::PeriodicAndOnChange_Output,
+		EGMC_InterpolationFunction::Linear
+	);
 
-		BI_Trj_IsCircling = BindBool(
-			Trj_IsCircling,
-			EGMC_PredictionMode::ClientAuth_Input,
-			EGMC_CombineMode::CombineIfUnchanged,
-			EGMC_SimulationMode::PeriodicAndOnChange_Output,
-			EGMC_InterpolationFunction::NearestNeighbour
-		);
+	BI_Trj_IsCircling = BindBool(
+		Trj_IsCircling,
+		EGMC_PredictionMode::ClientAuth_Input,
+		EGMC_CombineMode::CombineIfUnchanged,
+		EGMC_SimulationMode::PeriodicAndOnChange_Output,
+		EGMC_InterpolationFunction::NearestNeighbour
+	);
 
-		BI_TurningStrength = BindDoublePrecisionFloat(
-			TurningStrength,
-			EGMC_PredictionMode::ClientAuth_Input,
-			EGMC_CombineMode::CombineIfUnchanged,
-			EGMC_SimulationMode::PeriodicAndOnChange_Output,
-			EGMC_InterpolationFunction::Linear
-		);
-	} // bEnableGASPPipeline
+	BI_TurningStrength = BindDoublePrecisionFloat(
+		TurningStrength,
+		EGMC_PredictionMode::ClientAuth_Input,
+		EGMC_CombineMode::CombineIfUnchanged,
+		EGMC_SimulationMode::PeriodicAndOnChange_Output,
+		EGMC_InterpolationFunction::Linear
+	);
+
+	// Downed — ServerAuth, unlike every other bool here.
+	//
+	// WantsToStrafe / WantsToTraverse are client INPUTS, so ClientAuth_Input is right for
+	// them: the player decides. Downed is not an input — the server decides it from health,
+	// and a client must never be able to assert it. Hence ServerAuth_Output_ClientValidated,
+	// matching MovementDirection (the other server-computed value in this block).
+	//
+	// PeriodicAndOnChange_Output rather than MovementDirection's Periodic_Output because
+	// this flips rarely and the animation must switch the moment it does, not at the next
+	// periodic send.
+	//
+	// If BP starts predicting Downed locally on the owning client (setting it before the
+	// server agrees) this is the line to revisit — ServerAuth will overwrite the prediction.
+	BI_Downed = BindBool(
+		Downed,
+		EGMC_PredictionMode::ServerAuth_Output_ClientValidated,
+		EGMC_CombineMode::AlwaysCombine,
+		EGMC_SimulationMode::PeriodicAndOnChange_Output,
+		EGMC_InterpolationFunction::NearestNeighbour
+	);
 }
 
 // =====================================================================================
@@ -1878,6 +1930,47 @@ bool UGMCMotion::IsInputPresent(bool bAllowGrace) const
 bool UGMCMotion::IsObstacleTooLowForTraversal(float ObstacleHeight) const
 {
 	return MinTraversalObstacleHeight > 0.f && ObstacleHeight < MinTraversalObstacleHeight;
+}
+
+bool UGMCMotion::ShouldBlockTraversalForEquipment(UAnimMontage* TraversalMontage) const
+{
+	if (!bEquipmentBlocksTraversal)
+	{
+		return false;
+	}
+
+	// Exempt montages (hurdles, short vaults) are allowed even with weapon in hand
+	if (TraversalMontage && TraversalMontagesAllowedWithWeapon.Contains(TraversalMontage))
+	{
+		return false;
+	}
+
+	return true;
+}
+
+bool UGMCMotion::IsTraversalBlockedByEquipment(AActor* OwnerActor, UAnimMontage* TraversalMontage)
+{
+	if (!IsValid(OwnerActor))
+	{
+		return false;
+	}
+
+	UGMCMotion* Motion = OwnerActor->FindComponentByClass<UGMCMotion>();
+	if (!Motion)
+	{
+		return false;
+	}
+
+	const bool bBlocked = Motion->ShouldBlockTraversalForEquipment(TraversalMontage);
+
+	// If traversal is allowed despite equipment blocking being active (montage is in the exempt set),
+	// set the exempt flag so the safety-net gate in UpdateMovementModeDynamic also passes.
+	if (!bBlocked && Motion->bEquipmentBlocksTraversal)
+	{
+		Motion->bTraversalExemptFromEquipmentGate = true;
+	}
+
+	return bBlocked;
 }
 
 FRotator UGMCMotion::GetCurrentAimRotation() const
@@ -2034,15 +2127,6 @@ bool UGMCMotion::IsPivotPredicted(FVector& OutPivotLocation) const
 
 	const float ClampedThreshold = FMath::Clamp(PivotPredictionAngleThreshold, 90.f, 179.f);
 
-	// --- DEBUG: log pivot detection during sprint ---
-	if (CurrentGait == EGMCMotion_Gait::Sprint)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[SprintPivot] Angle=%.1f Threshold=%.1f %s Speed=%.0f DirThreshMode=%d"),
-			AngleDeg, ClampedThreshold,
-			AngleDeg >= ClampedThreshold ? TEXT("PIVOT") : TEXT("no-pivot"),
-			Speed2D, DirectionThresholdMode);
-	}
-
 	if (AngleDeg < ClampedThreshold)
 	{
 		OutPivotLocation = FVector::ZeroVector;
@@ -2163,13 +2247,6 @@ void UGMCMotion::ApplyFacingSpring(float TargetYaw, float DeltaSeconds)
 	// Write the smoothed yaw back to OverridenDesiredFacing for ApplyRotation to consume.
 	OverridenDesiredFacing.Yaw = FacingSpringPositionYaw;
 
-	// --- DEBUG: log spring activity during sprint ---
-	if (CurrentGait == EGMCMotion_Gait::Sprint && FMath::Abs(x0) > 5.f)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[SprintSpring] Target=%.1f Old=%.1f New=%.1f Disp=%.1f HalfLife=%.3f"),
-			TargetYaw, OldYaw, FacingSpringPositionYaw, x0, HalfLife);
-	}
-
 	// Angular velocity from actual step (for trajectory metrics / TurningStrength).
 	const float StepDeg = FMath::FindDeltaAngleDegrees(OldYaw, FacingSpringPositionYaw);
 	AngularVelocityRad = FMath::DegreesToRadians(StepDeg / DeltaSeconds);
@@ -2254,160 +2331,44 @@ void UGMCMotion::UpdateTrajectoryMetrics()
 	TurningStrength = FMath::Abs(FMath::RadiansToDegrees(AngularVelocityRad));
 }
 
-// UpdateMovementDirection: threshold-based direction quantization + rotation offset curve evaluation.
-void UGMCMotion::UpdateMovementDirection()
+bool UGMCMotion::CanSprintInCurrentDirection() const
 {
-	const uint8 PrevDirection = MovementDirection;
-	const double PrevOffset = RotationOffset;
-
-	// VelocityDirection mode: early-return Forward + 0 offset (orient-to-movement).
-	if (RotationMode == EGMCMotion_RotationMode::VelocityDirection)
+	// Restriction disabled: caller is asserting the animation set has strafe sprint coverage.
+	if (!bRestrictSprintToForwardCone)
 	{
-		MovementDirection = static_cast<uint8>(EGMCMotion_MovementDirection::F);
-		RotationOffset = 0.0;
-		return;
+		bSprintConeLatched = false;
+		return true;
 	}
 
-	// Direction source: use input acceleration when grounded, velocity when airborne.
-	// Matches the BP's GetMovementDirectionAndOffset which reads CustomComputeInputAcceleration
-	// on ground and velocity in air.
-	const bool bGrounded = GetMovementMode() == EGMC_MovementMode::Grounded;
-	const FVector DirectionVector = bGrounded ? CustomComputeInputAcceleration : GetLinearVelocity_GMC();
-
-	if (DirectionVector.Size2D() < 1.0f)
+	// No input: never block starting a sprint from standing.
+	const FVector Input = GetProcessedInputVector();
+	const FVector Input2D(Input.X, Input.Y, 0.f);
+	if (Input2D.IsNearlyZero())
 	{
-		return; // Keep current direction when nearly stationary.
+		bSprintConeLatched = false;
+		return true;
 	}
 
-	// Locomotion angle: direction relative to the orientation intent (camera forward in Aiming).
-	const float DirYaw = DirectionVector.Rotation().Yaw;
-	const float FacingYaw = GetOrientationIntent().Rotation().Yaw;
-	const float LocomotionAngle = FMath::FindDeltaAngleDegrees(FacingYaw, DirYaw);
-
-	// Sprint override: force Forward when gait is Sprint (matches BP's Gait == Sprint check).
-	if (CurrentGait == EGMCMotion_Gait::Sprint)
+	// Compare against OrientationIntent rather than actor facing. Intent is where the pawn is
+	// trying to face, so the cone reacts the moment the player pushes sideways instead of waiting
+	// for velocity or the capsule to catch up. In VelocityDirection mode OrientationIntent follows
+	// the input, so the angle is ~0 and sprint is never restricted; the cone only bites in Aiming.
+	const FVector Intent2D(OrientationIntent.X, OrientationIntent.Y, 0.f);
+	if (Intent2D.IsNearlyZero())
 	{
-		MovementDirection = static_cast<uint8>(EGMCMotion_MovementDirection::F);
-	}
-	else
-	{
-		MovementDirection = static_cast<uint8>(GetDirectionFromAngle(LocomotionAngle));
+		return true;
 	}
 
-	// Evaluate rotation offset curve for the computed direction.
-	// Forward-only mode (DirectionThresholdMode == 2): zero offset so the pawn always
-	// faces the camera direction exactly — no body turn toward movement. Required for
-	// true first person where any rotation offset causes visible spinning on strafe changes.
-	UCurveFloat* Curve = nullptr;
-	if (DirectionThresholdMode == 2)
-	{
-		RotationOffset = 0.0;
-	}
-	else
-	{
-		Curve = GetRotationOffsetCurveForDirection(static_cast<EGMCMotion_MovementDirection>(MovementDirection));
-		RotationOffset = Curve ? Curve->GetFloatValue(LocomotionAngle) : 0.0f;
-	}
+	const float AngleDeg = FMath::RadiansToDegrees(FMath::Acos(
+		FMath::Clamp(FVector::DotProduct(Input2D.GetSafeNormal(), Intent2D.GetSafeNormal()), -1.f, 1.f)));
 
-	// --- Diagnostic: log direction transitions and offset jumps ---
-	if (MovementDirection != PrevDirection)
-	{
-		UE_LOG(LogGMCMotion, Warning,
-			TEXT("[GASP Dir] CHANGE %d -> %d | locoAngle=%.1f | offset %.1f -> %.1f (delta=%.1f) | curve=%s | speed=%.0f sliding=%d sprint=%d"),
-			(int32)PrevDirection, (int32)MovementDirection,
-			LocomotionAngle,
-			PrevOffset, RotationOffset, RotationOffset - PrevOffset,
-			Curve ? *Curve->GetName() : TEXT("(null)"),
-			GetLinearVelocity_GMC().Size2D(),
-			bIsSliding ? 1 : 0,
-			(CurrentGait == EGMCMotion_Gait::Sprint) ? 1 : 0);
-	}
-}
+	// Wider threshold to stay in sprint than to enter it, so sitting on the boundary cannot flap
+	// the gait — and with it the animation set — every frame.
+	const float EnterAngle = FMath::Max(SprintForwardConeAngle, 0.f);
+	const float ExitAngle = EnterAngle + FMath::Max(SprintForwardConeHysteresis, 0.f);
 
-EGMCMotion_MovementDirection UGMCMotion::GetDirectionFromAngle(float Angle) const
-{
-	// Mode 2: forward-only
-	if (DirectionThresholdMode == 2)
-	{
-		return EGMCMotion_MovementDirection::F;
-	}
-
-	// Mode 1: 2-way (F/B only) with hysteresis
-	if (DirectionThresholdMode == 1)
-	{
-		// Hysteresis: when currently in B, narrower forward zone (±120);
-		// when in F or lateral, wider forward zone (±140).
-		const auto CurDir = static_cast<EGMCMotion_MovementDirection>(MovementDirection);
-		const float FrontLimit = (CurDir == EGMCMotion_MovementDirection::B) ? 120.0f : 140.0f;
-		return FMath::Abs(Angle) <= FrontLimit
-			? EGMCMotion_MovementDirection::F
-			: EGMCMotion_MovementDirection::B;
-	}
-
-	// Mode 0: GASP 4-way (F, LL, RL, B) with hysteresis from S_MovementDirectionThresholds.
-	// The original GASP Get_MovementDirectionFromThresholds only returns these 4 directions.
-	// LR/RR enum values exist but are never produced by the threshold function.
-	//
-	// The thresholds change based on the current direction to prevent flickering at boundaries:
-	//   When currently in F or B:  FL=-60, FR=60,  BL=-120, BR=120
-	//   When currently in lateral: FL=-40, FR=40,  BL=-140, BR=140
-	float FL, FR, BL, BR;
-	const auto CurDir0 = static_cast<EGMCMotion_MovementDirection>(MovementDirection);
-	if (CurDir0 == EGMCMotion_MovementDirection::F || CurDir0 == EGMCMotion_MovementDirection::B)
-	{
-		FL = -60.0f; FR = 60.0f; BL = -120.0f; BR = 120.0f;
-	}
-	else
-	{
-		FL = -40.0f; FR = 40.0f; BL = -140.0f; BR = 140.0f;
-	}
-
-	// Forward zone
-	if (Angle >= FL && Angle <= FR)
-	{
-		return EGMCMotion_MovementDirection::F;
-	}
-
-	// Left zone: [BL, FL)
-	if (Angle >= BL && Angle < FL)
-	{
-		return EGMCMotion_MovementDirection::LL;
-	}
-
-	// Right zone: (FR, BR]
-	if (Angle > FR && Angle <= BR)
-	{
-		return EGMCMotion_MovementDirection::RL;
-	}
-
-	// Everything else is Backward
-	return EGMCMotion_MovementDirection::B;
-}
-
-UCurveFloat* UGMCMotion::GetRotationOffsetCurveForDirection(EGMCMotion_MovementDirection Dir) const
-{
-	// Sliding override: matches CHT_RotationOffsetCurve rows 6-7.
-	// When sliding + F: use the F curve.  When sliding + anything else: use SlideKnees.
-	if (bIsSliding)
-	{
-		if (Dir == EGMCMotion_MovementDirection::F)
-		{
-			return RotationOffsetCurve_F;
-		}
-		return RotationOffsetCurve_SlideKnees;
-	}
-
-	// Normal (not sliding): 1:1 match of CHT_RotationOffsetCurve rows 0-5.
-	switch (Dir)
-	{
-	case EGMCMotion_MovementDirection::F:  return RotationOffsetCurve_F;
-	case EGMCMotion_MovementDirection::B:  return RotationOffsetCurve_B;
-	case EGMCMotion_MovementDirection::LL: return RotationOffsetCurve_LL;
-	case EGMCMotion_MovementDirection::LR: return RotationOffsetCurve_LR;
-	case EGMCMotion_MovementDirection::RL: return RotationOffsetCurve_RL;
-	case EGMCMotion_MovementDirection::RR: return RotationOffsetCurve_RR;
-	default: return nullptr;
-	}
+	bSprintConeLatched = bSprintConeLatched ? (AngleDeg <= ExitAngle) : (AngleDeg <= EnterAngle);
+	return bSprintConeLatched;
 }
 
 FVector UGMCMotion::GetOrientationIntent() const
@@ -2602,8 +2563,6 @@ void UGMCMotion::UpdateGroundedFacing(float DeltaSeconds)
 				if (Dot < -0.5f && !bSprintReversalHoldActive)
 				{
 					bSprintReversalHoldActive = true;
-					UE_LOG(LogTemp, Warning, TEXT("[SprintHold] ACTIVATED Dot=%.2f Speed=%.0f Target=%.1f SpringPos=%.1f"),
-						Dot, Vel.Size2D(), RawTargetYaw, FacingSpringPositionYaw);
 				}
 			}
 		}
@@ -2630,14 +2589,9 @@ void UGMCMotion::UpdateGroundedFacing(float DeltaSeconds)
 			bSprintReversalHoldActive = false;
 			bFacingSpringSettling = true;
 
-			const float OldSpringYaw = FacingSpringPositionYaw;
 			FacingSpringPositionYaw = IntentYaw;
 			FacingSpringVelocityYaw = 0.f;
 			OverridenDesiredFacing.Yaw = IntentYaw;
-
-			UE_LOG(LogTemp, Warning, TEXT("[SprintHold] RELEASED Speed=%.0f OldSpring=%.1f SnapTo=%.1f Target=%.1f (remaining=%.1f)"),
-				Speed2D, OldSpringYaw, IntentYaw, RawTargetYaw,
-				FMath::FindDeltaAngleDegrees(IntentYaw, RawTargetYaw));
 			// Fall through — spring settling handles the ~90° transition below.
 		}
 		else
