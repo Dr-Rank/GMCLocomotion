@@ -40,7 +40,7 @@ GMCGASP
   ├──────────────────────┼───────────────────────────────────────────────────┤
   │ GMC v2               │ Core movement component                           │
   ├──────────────────────┼───────────────────────────────────────────────────┤
-  │ GMAS 1.3             │ Ability system built for GMC                      │
+  │ GMAS- Deep Worlds + some slight adjustments: Ability system built for GMC│
   ├──────────────────────┼───────────────────────────────────────────────────┤
   │ GMCMotion            │ Trajectory prediction and motion-warped traversal │
   ├──────────────────────┼───────────────────────────────────────────────────┤
@@ -48,3 +48,4 @@ GMCGASP
   └──────────────────────┴───────────────────────────────────────────────────┘
 
 REALLY IMPORTANT NOTE: If you reparent the BP_GMC_Pawn to GMC_Pawn, or create your own pawn that uses GMCMotion, you must set the Tick Group on all the meshes you use to Post Physics, otherwise you'll see some animation glitchiness.
+Also, please use the UE5 Skeleton it's set up with - it includes and additional bone required for traversal
