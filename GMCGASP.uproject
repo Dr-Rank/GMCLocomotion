@@ -85,6 +85,10 @@
 		{
 			"Name": "Landmass",
 			"Enabled": false
+		},
+		{
+			"Name": "PhysicsControl",
+			"Enabled": true
 		}
 	],
 	"EpicSampleNameHash": "1673045636"
