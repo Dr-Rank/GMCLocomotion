@@ -21,7 +21,9 @@ public class GMCMotion : ModuleRules
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{
 			"InputCore",
-			"EnhancedInput"
+			"EnhancedInput",
+			"AnimationWarpingRuntime",
+			"AnimGraphRuntime"
 		});
 	}
 }

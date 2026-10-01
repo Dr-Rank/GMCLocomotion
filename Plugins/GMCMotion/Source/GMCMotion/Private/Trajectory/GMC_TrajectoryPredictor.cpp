@@ -2,10 +2,11 @@
 
 #include "Trajectory/GMC_TrajectoryPredictor.h"
 #include "GMCMotionLog.h"
+#include "Components/GMCMotion.h"
 #include "Components/GMCOrganicMovementComponent.h"
 #include "GameFramework/Pawn.h"
-#include "GameFramework/Controller.h"
 #include "Engine/World.h"
+#include "Animation/AnimInstance.h"
 #include "Components/SkeletalMeshComponent.h"
 
 UGMC_TrajectoryPredictor::UGMC_TrajectoryPredictor()
@@ -15,8 +16,60 @@ UGMC_TrajectoryPredictor::UGMC_TrajectoryPredictor()
 void UGMC_TrajectoryPredictor::Setup(UGMC_OrganicMovementCmp* InMovement)
 {
 	Movement = InMovement;
-	HistoryBuffer.Reset();
-	LastCaptureTime = 0.0f;
+	Motion = Cast<UGMCMotion>(InMovement);
+	VisualComponent = nullptr;
+	GetVisualComponent();
+
+	const UClass* MovementClass = InMovement ? InMovement->GetClass() : nullptr;
+	auto FindNumeric = [MovementClass](const TCHAR* Name) -> const FProperty*
+	{
+		const FNumericProperty* Prop = CastField<FNumericProperty>(MovementClass ? MovementClass->FindPropertyByName(Name) : nullptr);
+		return Prop && Prop->IsFloatingPoint() ? Prop : nullptr;
+	};
+	RunSpeedProp = FindNumeric(TEXT("RunSpeed"));
+	SprintSpeedProp = FindNumeric(TEXT("SprintSpeed"));
+	RunTurnStrengthProp = FindNumeric(TEXT("Walk/RunTurnStrength"));
+	SprintTurnStrengthProp = FindNumeric(TEXT("SprintTurnStrength"));
+	TraversingProp = MovementClass ? CastField<FBoolProperty>(MovementClass->FindPropertyByName(TEXT("Traversing"))) : nullptr;
+}
+
+float UGMC_TrajectoryPredictor::GetTurnStrength(float SpeedXY) const
+{
+	if (!Movement || !RunSpeedProp || !SprintSpeedProp || !RunTurnStrengthProp || !SprintTurnStrengthProp)
+	{
+		return -1.f;
+	}
+	auto Read = [this](const FProperty* Prop)
+	{
+		return static_cast<float>(CastField<FNumericProperty>(Prop)->GetFloatingPointPropertyValue(Prop->ContainerPtrToValuePtr<void>(Movement)));
+	};
+	// Same as BP_GMCMovement::TurningStrengthFunction (MapRangeClamped).
+	return FMath::GetMappedRangeValueClamped(FVector2f(Read(RunSpeedProp), Read(SprintSpeedProp)),
+		FVector2f(Read(RunTurnStrengthProp), Read(SprintTurnStrengthProp)), SpeedXY);
+}
+
+USceneComponent* UGMC_TrajectoryPredictor::GetVisualComponent() const
+{
+	if (USceneComponent* Cached = VisualComponent.Get())
+	{
+		return Cached;
+	}
+	// The ABP constructs the predictor with itself as outer: its mesh is the body the trajectory is for. The pawn can
+	// carry other skeletal meshes (first-person body, modular parts), so FindComponentByClass is only a fallback.
+	USceneComponent* Found = nullptr;
+	if (const UAnimInstance* AnimInstance = Cast<UAnimInstance>(GetOuter()))
+	{
+		Found = AnimInstance->GetSkelMeshComponent();
+	}
+	if (!Found && Movement)
+	{
+		if (const AActor* Owner = Movement->GetOwner())
+		{
+			Found = Owner->FindComponentByClass<USkeletalMeshComponent>();
+		}
+	}
+	VisualComponent = Found;
+	return Found;
 }
 
 void UGMC_TrajectoryPredictor::GetVelocity(FVector& OutVelocity)
@@ -26,7 +79,12 @@ void UGMC_TrajectoryPredictor::GetVelocity(FVector& OutVelocity)
 
 void UGMC_TrajectoryPredictor::GetAngularVelocity(FVector& OutAngularVelocityDegrees)
 {
-	OutAngularVelocityDegrees = FVector::ZeroVector;
+	// Yaw rate of the capsule from the last move (ApplyRotation), bound so simulated proxies get it too. The library
+	// subtracts it from the frame's facing change to infer a moving-platform rotation applied to the history: returning
+	// 0 while the pawn turns would make it rotate the whole history with the pawn.
+	OutAngularVelocityDegrees = Motion
+		? FVector(0.f, 0.f, FMath::RadiansToDegrees(Motion->AngularVelocityRad))
+		: FVector::ZeroVector;
 }
 
 void UGMC_TrajectoryPredictor::GetGravity(FVector& OutGravityAccel)
@@ -54,16 +112,19 @@ void UGMC_TrajectoryPredictor::GetCurrentState(FVector& OutPosition, FQuat& OutF
 		OutVelocity = FVector::ZeroVector;
 		return;
 	}
-	const AActor* Owner = Movement->GetOwner();
-	if (Owner)
+	// Position and facing of the visual mesh, like Mover's predictor (bUseVisualComponentRoot): the trajectory is the
+	// root bone's path (feet level, what the pose search databases and HandleTransformTrajectoryWorldCollisions expect),
+	// and it includes GMC's mesh smoothing on simulated proxies. Facing stays in mesh space (Mover's samples report the
+	// -90 import offset too); putting the actor yaw here injected that offset into the trajectory (spawn pivot).
+	if (const USceneComponent* Visual = GetVisualComponent())
+	{
+		OutPosition = Visual->GetComponentLocation();
+		OutFacing = Visual->GetComponentQuat();
+	}
+	else if (const AActor* Owner = Movement->GetOwner())
 	{
 		OutPosition = Owner->GetActorLocation();
-		// Trajectory facing in MESH/component space, matching Mover's MoverTrajectoryPredictor
-		// (its samples report Facing yaw = -90, the mesh import offset). Avoids injecting the
-		// ~90deg mesh offset into the trajectory facing (which caused the spawn pivot / constant
-		// offset-root reconciliation). The pawn still turns via anim root motion + ApplyFacingSpring.
-		const USkeletalMeshComponent* Mesh = Owner->FindComponentByClass<USkeletalMeshComponent>();
-		OutFacing = Mesh ? Mesh->GetComponentQuat() : Owner->GetActorQuat();
+		OutFacing = Owner->GetActorQuat();
 	}
 	else
 	{
@@ -75,164 +136,104 @@ void UGMC_TrajectoryPredictor::GetCurrentState(FVector& OutPosition, FQuat& OutF
 
 void UGMC_TrajectoryPredictor::Predict(FTransformTrajectory& InOutTrajectory, int32 NumPredictionSamples, float SecondsPerPredictionSample, int32 NumHistorySamples)
 {
-	InOutTrajectory.Samples.Reset();
-
-	FVector CurrentPos;
-	FQuat CurrentFacing;
-	FVector CurrentVelocity;
-	GetCurrentState(CurrentPos, CurrentFacing, CurrentVelocity);
-
-	// Capture a history sample, stamped with the REAL game time. Emitting past samples
-	// with a fixed 1/30 label (the old code) over-estimated past velocity whenever frames
-	// ran slower than 30fps - GetTrajectoryVelocity divides dPos by the labeled dt, so a
-	// real 0.045s frame labeled as 0.0333s reported ~1.36x the true speed, and it jittered
-	// with frame time. The schema samples history at -0.05s, so that corrupted, noisy feature
-	// fed Motion Matching and caused pose-selection flip-flop. Use real elapsed time instead.
-	const UWorld* World = GetWorld();
-	const float Now = World ? World->GetTimeSeconds() : 0.0f;
-	if (HistoryBuffer.Num() == 0 || (Now - LastCaptureTime) >= HistorySamplingInterval)
+	// The library has already written the history and the current sample (index NumHistorySamples, stamped with the
+	// frame's delta time); only the future samples are ours, in place.
+	if (!Movement || InOutTrajectory.Samples.Num() != NumHistorySamples + 1 + NumPredictionSamples)
 	{
-		FTransformTrajectorySample HistorySample;
-		HistorySample.TimeInSeconds = Now;   // store ABSOLUTE capture time; converted to relative on emit
-		HistorySample.Position = CurrentPos;
-		HistorySample.Facing = CurrentFacing;
-		HistoryBuffer.Add(HistorySample);
-		LastCaptureTime = Now;
-	}
-
-	// Trim buffer to the requested history length.
-	const int32 MaxHistory = FMath::Max(NumHistorySamples, 1);
-	while (HistoryBuffer.Num() > MaxHistory)
-	{
-		HistoryBuffer.RemoveAt(0, EAllowShrinking::No);
-	}
-
-	// Past samples: emit oldest first with REAL negative TimeInSeconds relative to now,
-	// so GetTrajectoryVelocity recovers the true past velocity (and the -0.05s schema sample
-	// lands on the correct physical position).
-	const int32 HistoryCount = HistoryBuffer.Num();
-	for (int32 i = 0; i < HistoryCount; ++i)
-	{
-		FTransformTrajectorySample Sample = HistoryBuffer[i];
-		Sample.TimeInSeconds = HistoryBuffer[i].TimeInSeconds - Now;
-		InOutTrajectory.Samples.Add(Sample);
-	}
-
-	// Future samples: mimic Mover's per-step replay of the movement mode.
-	//  - Linear: accelerate toward input dir + clamp to MaxSpeed, OR brake+friction when input is zero.
-	//  - Angular: step yaw toward control rotation or input direction at RotationRate (matches
-	//    GMC's bOrientToControlRotationDirection / bOrientToInputDirection).
-	if (Movement)
-	{
-		FVector ProjPos = CurrentPos;
-		FVector ProjVel = CurrentVelocity;
-		FQuat   ProjFacing = CurrentFacing;
-
-		// Prefer the bound CustomComputeInputAcceleration (BindCompressedVector) when available.
-		// It is in world space and consistent across all roles, unlike GetProcessedInputVector()
-		// which on the autonomous proxy can be in camera-local space during client-side prediction,
-		// producing trajectories that diverge from the authority for the same pawn.
-		FVector InputVector = FVector::ZeroVector;
-		if (const FProperty* InputProp = Movement->GetClass()->FindPropertyByName(TEXT("CustomComputeInputAcceleration")))
+		if (Movement && !bWarnedTrajectorySize)
 		{
-			if (const FStructProperty* SP = CastField<FStructProperty>(InputProp))
+			bWarnedTrajectorySize = true;
+			UE_LOG(LogGMCMotion, Warning, TEXT("UGMC_TrajectoryPredictor::Predict - trajectory has %d samples, expected %d history + 1 current + %d predicted; left untouched."),
+				InOutTrajectory.Samples.Num(), NumHistorySamples, NumPredictionSamples);
+		}
+		return;
+	}
+
+	const FTransformTrajectorySample& Current = InOutTrajectory.Samples[NumHistorySamples];
+	const float CurrentTime = Current.TimeInSeconds;
+	FVector ProjPos = Current.Position;
+	FQuat ProjFacing = Current.Facing;
+	FVector ProjVel = Movement->GetLinearVelocity_GMC();
+
+	// Future samples: replay of the GMC move (Mover does the same with its own movement mode), see the step below.
+
+	// CustomComputeInputAcceleration (bound, world space) is consistent across all roles, unlike
+	// GetProcessedInputVector() which on the autonomous proxy can be in camera-local space during client-side
+	// prediction, producing trajectories that diverge from the authority for the same pawn.
+	FVector InputVector = FVector::ZeroVector;
+	if (Motion)
+	{
+		InputVector = Motion->CustomComputeInputAcceleration;
+	}
+	else if (const FStructProperty* SP = CastField<FStructProperty>(Movement->GetClass()->FindPropertyByName(TEXT("CustomComputeInputAcceleration"))))
+	{
+		if (SP->Struct == TBaseStructure<FVector>::Get())
+		{
+			InputVector = *SP->ContainerPtrToValuePtr<FVector>(Movement);
+		}
+	}
+
+	const FVector InputDir = InputVector.GetSafeNormal();
+	const bool bHasInput = !InputDir.IsNearlyZero();
+
+	const float InputAccel = Movement->GetInputAcceleration();
+	const float MaxSpeed = Movement->GetMaxSpeed();
+	const float Friction = Movement->GetGroundFriction();
+	const float Braking = Movement->GetBrakingDeceleration();
+	const float OverMaxSpeedDecel = Movement->GetOverMaxSpeedDeceleration();
+	const FVector Gravity = Movement->GetGravity();
+
+	// Target yaw the pawn rotates toward each tick: OverridenDesiredFacing (world space), the goal UpdateGroundedFacing
+	// writes and ApplyRotation turns the capsule to, strafe offset included. OrientationIntent is only the aim
+	// component WITHOUT that offset (a settled strafe would then read as a constant turn).
+	const float YawRate = Movement->RotationRate;
+	bool  bHasTargetYaw = false;
+	float TargetYawDeg = 0.f;
+
+	if (Motion)
+	{
+		TargetYawDeg = Motion->OverridenDesiredFacing.Yaw;
+		bHasTargetYaw = true;
+	}
+	else
+	{
+		// Plain organic component: same targets read by name when a subclass declares them.
+		const UClass* MovementClass = Movement->GetClass();
+		if (const FStructProperty* SP = CastField<FStructProperty>(MovementClass->FindPropertyByName(TEXT("OverridenDesiredFacing"))))
+		{
+			if (SP->Struct == TBaseStructure<FRotator>::Get())
+			{
+				TargetYawDeg = SP->ContainerPtrToValuePtr<FRotator>(Movement)->Yaw;
+				bHasTargetYaw = true;
+			}
+		}
+		if (!bHasTargetYaw)
+		{
+			if (const FStructProperty* SP = CastField<FStructProperty>(MovementClass->FindPropertyByName(TEXT("OrientationIntent"))))
 			{
 				if (SP->Struct == TBaseStructure<FVector>::Get())
 				{
-					InputVector = *SP->ContainerPtrToValuePtr<FVector>(Movement);
-				}
-			}
-		}
-
-		const FVector InputDir = InputVector.GetSafeNormal();
-		const bool bHasInput = !InputDir.IsNearlyZero();
-
-		const float InputAccel = Movement->GetInputAcceleration();
-		const float MaxSpeed = Movement->GetMaxSpeed();
-		const float Friction = Movement->GetGroundFriction();
-		const float Braking = Movement->GetBrakingDeceleration();
-
-		// Target yaw the pawn rotates toward each tick.
-		// The actor is rotated by ApplyFacingSpring (critically-damped spring) toward
-		// OverridenDesiredFacing, computed in Update_Grounded as Combine(Get_TargetOrientation,
-		// strafe/turn yaw offset). That offset is the ACTUAL goal the pawn settles on
-		// (e.g. -90 in stable left strafe). Earlier this read OrientationIntent, which is only
-		// the aim component WITHOUT the strafe offset -> the predictor believed the pawn had to
-		// keep turning by that offset every frame, encoding a constant angular velocity equal to
-		// RotationRate in the trajectory (the 0,0,650 vs Mover's 0,0,0). Target the real spring
-		// goal so a settled strafe yields zero trajectory angular velocity. Read via reflection
-		// (world-space FRotator); fall back to OrientationIntent / native flags if absent.
-		const float YawRate = Movement->RotationRate;
-		bool  bHasTargetYaw = false;
-		float TargetYawDeg = 0.f;
-
-		if (const FProperty* FacingProp = Movement->GetClass()->FindPropertyByName(TEXT("OverridenDesiredFacing")))
-		{
-			if (const FStructProperty* SP = CastField<FStructProperty>(FacingProp))
-			{
-				if (SP->Struct == TBaseStructure<FRotator>::Get())
-				{
-					TargetYawDeg = SP->ContainerPtrToValuePtr<FRotator>(Movement)->Yaw; // world space
-					bHasTargetYaw = true;
-				}
-			}
-		}
-
-		// Fallback: OrientationIntent (aim component only, world-space vector). Used if the
-		// component does not expose OverridenDesiredFacing (e.g. a different movement mode).
-		if (!bHasTargetYaw)
-		{
-			if (const FProperty* IntentProp = Movement->GetClass()->FindPropertyByName(TEXT("OrientationIntent")))
-			{
-				if (const FStructProperty* StructProp = CastField<FStructProperty>(IntentProp))
-				{
-					if (StructProp->Struct == TBaseStructure<FVector>::Get())
+					const FVector Intent = *SP->ContainerPtrToValuePtr<FVector>(Movement);
+					const FVector IntentFlat = FVector(Intent.X, Intent.Y, 0.f).GetSafeNormal();
+					if (!IntentFlat.IsNearlyZero())
 					{
-						const FVector OrientationIntent = *StructProp->ContainerPtrToValuePtr<FVector>(Movement);
-						if (!OrientationIntent.IsNearlyZero())
-						{
-							const FVector IntentFlat = FVector(OrientationIntent.X, OrientationIntent.Y, 0.f).GetSafeNormal();
-							if (!IntentFlat.IsNearlyZero())
-							{
-								TargetYawDeg = IntentFlat.Rotation().Yaw;
-								bHasTargetYaw = true;
-							}
-						}
+						TargetYawDeg = IntentFlat.Rotation().Yaw;
+						bHasTargetYaw = true;
 					}
 				}
 			}
 		}
-		// ProjFacing is in mesh space (see GetCurrentState). The target above is in world/actor space.
-		// Convert TargetYaw to mesh space by applying the mesh's yaw offset from the actor.
-		if (bHasTargetYaw)
-		{
-			if (const AActor* Owner = Movement->GetOwner())
-			{
-				if (const USkeletalMeshComponent* Mesh = Owner->FindComponentByClass<USkeletalMeshComponent>())
-				{
-					const float MeshYawOffset = FRotator::NormalizeAxis(
-						Mesh->GetComponentQuat().Rotator().Yaw - Owner->GetActorQuat().Rotator().Yaw);
-					TargetYawDeg = FRotator::NormalizeAxis(TargetYawDeg + MeshYawOffset);
-				}
-			}
-		}
-
 		if (!bHasTargetYaw)
 		{
 			if (Movement->bOrientToControlRotationDirection)
 			{
-				// Read AimingRotation2 (BindCompressedRotator) instead of the local controller.
-				// GetController() is null on simulated proxies; the bound value is correct on all roles.
-				if (const FProperty* Prop = Movement->GetClass()->FindPropertyByName(TEXT("AimingRotation2")))
+				// AimingRotation2 (BindCompressedRotator) instead of the local controller, null on simulated proxies.
+				if (const FStructProperty* SP = CastField<FStructProperty>(MovementClass->FindPropertyByName(TEXT("AimingRotation2"))))
 				{
-					if (const FStructProperty* SP = CastField<FStructProperty>(Prop))
+					if (SP->Struct == TBaseStructure<FRotator>::Get())
 					{
-						if (SP->Struct == TBaseStructure<FRotator>::Get())
-						{
-							const FRotator R = *SP->ContainerPtrToValuePtr<FRotator>(Movement);
-							TargetYawDeg = R.Yaw;
-							bHasTargetYaw = true;
-						}
+						TargetYawDeg = SP->ContainerPtrToValuePtr<FRotator>(Movement)->Yaw;
+						bHasTargetYaw = true;
 					}
 				}
 			}
@@ -246,54 +247,141 @@ void UGMC_TrajectoryPredictor::Predict(FTransformTrajectory& InOutTrajectory, in
 				}
 			}
 		}
+	}
 
-		for (int32 i = 1; i <= NumPredictionSamples; ++i)
+	// ProjFacing is in mesh space (see GetCurrentState), the target in actor space: add the mesh's yaw offset.
+	if (bHasTargetYaw)
+	{
+		const USceneComponent* Visual = GetVisualComponent();
+		const AActor* Owner = Movement->GetOwner();
+		if (Visual && Owner)
 		{
-			const float t = i * SecondsPerPredictionSample;
-			const float dt = SecondsPerPredictionSample;
+			const float MeshYawOffset = FRotator::NormalizeAxis(
+				Visual->GetComponentQuat().Rotator().Yaw - Owner->GetActorQuat().Rotator().Yaw);
+			TargetYawDeg = FRotator::NormalizeAxis(TargetYawDeg + MeshYawOffset);
+		}
+	}
 
-			// --- Linear update ---
-			FVector NewVel;
-			if (bHasInput)
+	// Linear model per movement mode:
+	//  - grounded / airborne: GMC's CalculateVelocity (UGMC_OrganicMovementCmp::ApplyInputVelocity, ApplyExternalForces,
+	//    ApplyDeceleration, LimitSpeed; traction 0) then BP_GMCMovement::VelocityAdjustments (PostPhysicsUpdate: while
+	//    grounded with input, the XY velocity is re-aimed at the input direction at constant speed, VInterpTo at the BP
+	//    TurningStrength). Stepped at ~60 Hz like the moves, sampled every SecondsPerPredictionSample.
+	//  - anything else (slope slide, custom modes): the current velocity is kept.
+	const bool bGrounded = Movement->IsMovingOnGround();
+	const bool bAirborne = Movement->IsAirborne();
+	const bool bReplayMove = (bGrounded || bAirborne) && !(Motion && Motion->IsSlopeSliding());
+	const bool bTraversing = TraversingProp && CastField<FBoolProperty>(TraversingProp)->GetPropertyValue_InContainer(Movement);
+	const FVector InputAcceleration = bHasInput ? InputDir * InputAccel * (bGrounded ? FMath::Min(Friction, 1.f) : 1.f) : FVector::ZeroVector;
+	constexpr float MinDeceleration = 5.f;      // UGMC_OrganicMovementCmp::MIN_DECELERATION
+	constexpr float BrakeToStopVelocity = UE_KINDA_SMALL_NUMBER;
+
+	auto StepMove = [&](FVector& V, float H)
+	{
+		if (bGrounded)
+		{
+			V.Z = 0.;
+		}
+		// ApplyInputVelocity + ApplyExternalForces.
+		V += InputAcceleration * H;
+		FVector TransientAcceleration = InputAcceleration;
+		if (bAirborne)
+		{
+			V += Gravity * H;
+			TransientAcceleration += Gravity;
+		}
+		// ApplyDeceleration: brakes only against the part of the velocity we are not accelerating along.
+		if (!V.IsZero())
+		{
+			const float Scale = FMath::Clamp(1.f - (TransientAcceleration.GetSafeNormal() | V.GetSafeNormal()), 0.f, 1.f);
+			FVector Decel = Braking * Scale * -V.GetSafeNormal();
+			if (bGrounded)
 			{
-				NewVel = ProjVel + InputDir * (InputAccel * dt);
-				NewVel = NewVel.GetClampedToMaxSize(MaxSpeed);
+				Decel *= Friction;
+			}
+			else if (bAirborne && V.Z < 0.)
+			{
+				Decel.Z = 0.;   // no braking against gravity
+			}
+			if (!Decel.IsZero())
+			{
+				const FVector DecelXY(Decel.X, Decel.Y, 0.);
+				if (DecelXY.SizeSquared() > 0. && DecelXY.SizeSquared() < FMath::Square(MinDeceleration))
+				{
+					Decel = DecelXY.GetClampedToSize(MinDeceleration, UE_BIG_NUMBER) + FVector(0., 0., Decel.Z);
+				}
+				const FVector Start = V;
+				V += Decel * H;
+				if ((Start | V) <= 0. || V.SizeSquared() <= FMath::Square(BrakeToStopVelocity))
+				{
+					V = FVector::ZeroVector;
+				}
+			}
+		}
+		// LimitSpeed (grounded: XYZ, airborne: XY), never below the max speed.
+		const FVector Limited = bAirborne ? FVector(V.X, V.Y, 0.) : V;
+		if (Limited.SizeSquared() > FMath::Square(MaxSpeed))
+		{
+			const FVector Dir = Limited.GetSafeNormal();
+			FVector NewLimited = Limited - Dir * OverMaxSpeedDecel * H;
+			if ((NewLimited | Limited) <= 0. || NewLimited.SizeSquared() < FMath::Square(MaxSpeed))
+			{
+				NewLimited = Dir * MaxSpeed;
+			}
+			V = bAirborne ? FVector(NewLimited.X, NewLimited.Y, V.Z) : NewLimited;
+		}
+		// BP VelocityAdjustments (PostPhysicsUpdate).
+		const float SpeedXY = V.Size2D();
+		if (bHasInput && !bAirborne && !bTraversing && SpeedXY > 1.f)
+		{
+			const float TurnStrength = GetTurnStrength(SpeedXY);
+			if (TurnStrength >= 0.f)
+			{
+				const FVector CurrentXY(V.X, V.Y, 0.);
+				const FVector TargetXY = FVector(InputDir.X, InputDir.Y, 0.).GetSafeNormal() * SpeedXY;
+				const FVector NewXY = FMath::VInterpTo(CurrentXY, TargetXY, H, TurnStrength);
+				V.X = NewXY.X;
+				V.Y = NewXY.Y;
+			}
+		}
+	};
+
+	const float dt = SecondsPerPredictionSample;
+	const int32 SubSteps = FMath::Max(1, FMath::CeilToInt32(dt * 60.f));
+	const float H = dt / SubSteps;
+	for (int32 i = 1; i <= NumPredictionSamples; ++i)
+	{
+		// --- Linear update ---
+		for (int32 Step = 0; Step < SubSteps; ++Step)
+		{
+			if (bReplayMove)
+			{
+				FVector NewVel = ProjVel;
+				StepMove(NewVel, H);
+				ProjPos += (ProjVel + NewVel) * 0.5f * H;
+				ProjVel = NewVel;
 			}
 			else
 			{
-				const float Speed = ProjVel.Size();
-				if (Speed > KINDA_SMALL_NUMBER)
-				{
-					// CMC-style stop: linear braking + proportional friction.
-					const float Decel = (Braking + Friction * Speed) * dt;
-					const float NewSpeed = FMath::Max(0.f, Speed - Decel);
-					NewVel = ProjVel * (NewSpeed / Speed);
-				}
-				else
-				{
-					NewVel = FVector::ZeroVector;
-				}
+				ProjPos += ProjVel * H;
 			}
-
-			ProjPos += (ProjVel + NewVel) * 0.5f * dt;
-			ProjVel = NewVel;
-
-			// --- Angular update ---
-			if (bHasTargetYaw && YawRate > 0.f)
-			{
-				FRotator ProjRot = ProjFacing.Rotator();
-				const float DeltaYaw = FMath::FindDeltaAngleDegrees(ProjRot.Yaw, TargetYawDeg);
-				const float MaxStep = YawRate * dt;
-				const float Step = FMath::Clamp(DeltaYaw, -MaxStep, MaxStep);
-				ProjRot.Yaw += Step;
-				ProjFacing = ProjRot.Quaternion();
-			}
-
-			FTransformTrajectorySample FutureSample;
-			FutureSample.TimeInSeconds = t;
-			FutureSample.Position = ProjPos;
-			FutureSample.Facing = ProjFacing;
-			InOutTrajectory.Samples.Add(FutureSample);
 		}
+
+		// --- Angular update ---
+		// BP_GMCMovement runs with RotationRate 0 (instant snap in GMC): the capsule is already on its target every
+		// frame, so the facing is kept. A free look would make a predicted snap wrong.
+		if (bHasTargetYaw && YawRate > 0.f)
+		{
+			FRotator ProjRot = ProjFacing.Rotator();
+			const float DeltaYaw = FMath::FindDeltaAngleDegrees(ProjRot.Yaw, TargetYawDeg);
+			const float Step = FMath::Clamp(DeltaYaw, -YawRate * dt, YawRate * dt);
+			ProjRot.Yaw += Step;
+			ProjFacing = ProjRot.Quaternion();
+		}
+
+		FTransformTrajectorySample& FutureSample = InOutTrajectory.Samples[NumHistorySamples + i];
+		FutureSample.TimeInSeconds = CurrentTime + i * dt;
+		FutureSample.Position = ProjPos;
+		FutureSample.Facing = ProjFacing;
 	}
 }

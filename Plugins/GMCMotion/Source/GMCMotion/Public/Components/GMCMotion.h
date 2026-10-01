@@ -345,6 +345,114 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal Warp")
 	bool bSuppressBlendOutGlide = true;
 
+	// Before the first warp window of a jump-over, keep the animation's run-up root motion, capped so the capsule stops
+	// short of the obstacle's front face (radius + PreWindowFaceClearance). The GASP "run" hurdles start around 0.28 s
+	// and open their FrontLedge window around 0.51 s. False = old behaviour: horizontal root motion zeroed until the
+	// window opens, which froze the capsule ~0.23 s at traversal start, then the warp caught up at ~1000 cm/s.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal Warp")
+	bool bKeepPreWindowRunUp = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal Warp", meta = (ClampMin = "0.0"))
+	float PreWindowFaceClearance = 5.0f;
+
+	// Pre-window run-up paced for the whole approach: the horizontal scale is (distance to the first warp window's target)
+	// / (anim run-up until that window ends), so the speed does not step when the window opens (was 581 -> 270 cm/s in
+	// one frame on a late press). Recomputed every frame (convergent, up to PreWindowMaxScale). False = run-up at anim
+	// speed, only stopped at the face.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal Warp")
+	bool bPreWindowMatchFirstWindow = true;
+
+	// Ceiling of that pre-window pace. Above 1 it only makes up the distance lost to the entry blend: stretching the flat
+	// run-up for a far obstacle (740 cm/s measured) brought the capsule to the face before the jump rose, and it stalled
+	// against the wall; the rest of the stretch is left to the window (rising part).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal Warp", meta = (ClampMin = "1.0"))
+	float PreWindowMaxScale = 1.1f;
+
+	// Over this much montage time after the traversal starts, the pre-window horizontal speed goes from the speed the
+	// pawn entered with (TraversalEntrySpeed) to the run-up speed, instead of jumping to the anim's (~600 cm/s from a
+	// 375 cm/s run; GASP58 ramps ~375 -> 490). 0 = off.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal Warp", meta = (ClampMin = "0.0"))
+	float TraversalEntrySpeedBlendTime = 0.25f;
+
+	// After a jump-over's warp window closes, the horizontal speed goes from the window's last warped speed to the
+	// animation's over this much montage time (a late press compresses the FrontLedge window to ~240 cm/s, the raw anim
+	// then resumed at ~535 in one frame). 0 = off.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal Warp", meta = (ClampMin = "0.0"))
+	float WarpWindowExitBlendTime = 0.12f;
+
+	// BP_GMCMovement calls StopTraversalMovement at traversal START (right after the montage is played). Zeroing the
+	// velocity there makes the first traversal move stand still (Custom1 / Airborne integrate the previous velocity;
+	// the montage root motion only takes over on the next move): a one-frame freeze. False = keep the run velocity.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal Warp")
+	bool bZeroVelocityAtTraversalStart = false;
+
+	// Floor of the horizontal warp scale in the landing (BackFloor) window of a jump-over. BackFloor is a floor point
+	// just behind the obstacle, often only 25-45 cm ahead when the window opens while the animation still runs ~100 cm:
+	// the convergent warp slowed the capsule to 30-45 % of the anim speed, then to 0 once the point was reached (the
+	// capsule dropped vertically for ~0.1 s, then RestoreTraversalExitVelocity relaunched it). 1 = never slower than
+	// the animation (lands a little past the point, like GASP58), 0 = old behaviour.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal Warp", meta = (ClampMin = "0.0"))
+	float HurdleLandingMinWarpScale = 1.0f;
+
+	// After a jump-over, RestoreTraversalExitVelocity hands the anim's landing speed (~520-550 cm/s) to locomotion, above
+	// the run max (375): GMC's LimitSpeed then dropped it to max in 1-2 frames (OverMaxSpeedDecelerationGrounded 10000),
+	// a visible speed sawtooth between chained hurdles. While that carry lasts (until back at max speed, input released
+	// or turned away, or the next traversal) the over-speed deceleration is this value instead (GASP58 decays
+	// ~510 -> 375 in ~0.4 s). 0 = off (old behaviour).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal Warp", meta = (ClampMin = "0.0"))
+	float TraversalExitOverSpeedDeceleration = 400.0f;
+
+	// The over-speed carry above is only meant for a jump-over with the input still along the run. Anything else (mantle,
+	// or input released / turned away) gets the anim's exit speed capped at the current max speed: the GASP run mantles
+	// (Mantle_*_run) root-move at a constant 517 cm/s, for a 375 run max, and with the input released the braking alone
+	// took ~0.85 s / 180 cm to stop (slid across a 2.8 m platform, user report 2026-10-01). false = old behaviour.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal Warp")
+	bool bCapTraversalExitSpeed = true;
+
+	// A traversal that ends in the air (vault over a drop) hands the anim's downward speed to the fall instead of Z = 0,
+	// which restarted the fall from rest (a hang/bump in mid-air). false = old behaviour.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal Warp")
+	bool bKeepTraversalExitFallSpeed = true;
+
+	// Air catches (GASP "Catch" montages: mantle / cliff / hurdle / vault grabbed while falling) start inside their
+	// FrontLedge window (~0.1 s left) with the body hanging out from the wall. Their horizontal FrontLedge target follows
+	// the animation's root -> warp-bone offset at window end (like GASP's motion warping), at least the capsule radius
+	// out from the face, with no ReachLedgePush. False = old behaviour: radius inset + push like a standing mantle, which
+	// threw the capsule at the wall at 600-1350 cm/s on the first catch frames.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal Warp")
+	bool bCatchWarpUsesAnimOffset = true;
+
+	// Same horizontal target for the ground reach montages (mantle / vault / climb): at the FrontLedge window end the GASP
+	// anims still have the root ~50 cm out from the wall (hands on the ledge). The radius inset + ReachLedgePush target
+	// made the capsule cover ~180 cm instead of the anim's ~128 in the 0.24 s window: 375 -> 765 cm/s on a run mantle,
+	// 894 on a run vault (user report 2026-10-01). False = old behaviour.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal Warp")
+	bool bReachWarpUsesAnimOffset = true;
+
+	// True for the GASP air-catch traversal montages (name contains "Catch").
+	UFUNCTION(BlueprintPure, Category = "Traversal Warp")
+	static bool IsCatchTraversalMontage(const UAnimMontage* Montage);
+
+	// Ground reach montages (mantle / vault / climb, not jump-overs or catches): the chooser's pose search picks the start
+	// frame mostly on pose / trajectory, not on the distance to the ledge. With the 5.8 Relaxed montages it picked the end
+	// of the searchable range (ledge expected at 137 cm, real 199): 62 cm to make up in the 0.12 s before the FrontLedge
+	// window = 951 cm/s (2026-10-01). The start is moved inside the montage's searchable range (PoseSearchSamplingRange,
+	// else PoseSearchBranchIn) so that the anim's run-up to the first FrontLedge window end covers the real distance to the
+	// warp target at TraversalStartTimeWarpScale. false = keep the chooser's start time.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal Warp")
+	bool bAdjustTraversalStartTimeByDistance = true;
+
+	// Warp scale aimed at by the start-time adjustment: < 1 starts a bit early so the warp slows the run-up down (GASP58
+	// errs that way: ~0.67), > 1 would speed it up.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal Warp", meta = (ClampMin = "0.3", ClampMax = "1.5"))
+	float TraversalStartTimeWarpScale = 0.9f;
+
+	// Start time to play Montage at (see bAdjustTraversalStartTimeByDistance), for the pawn owning Context's movement
+	// component. Returns StartTime unchanged when not applicable. Called from TryTraversalAction right after the chooser.
+	UFUNCTION(BlueprintPure, Category = "Traversal Warp", meta = (DefaultToSelf = "Context"))
+	static float AdjustTraversalStartTimeForDistance(const UObject* Context, UObject* Montage, float StartTime,
+		FVector FrontLedgeLocation, FVector FrontLedgeNormal);
+
 	// ─── Equipment-Gated Traversal ──────────────────────────────────────────────
 	//
 	// When the game mode requires holster-before-traverse, the equipment system sets
@@ -413,9 +521,9 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Traversal Warp")
 	UAnimMontage* GetTraversalMontageForFoot(UAnimMontage* Montage, bool bRightFoot) const;
 
-	// Zeroes the pawn's velocity. Call at traversal start (drop entry momentum so it doesn't
-	// fight the warp) and end (stop the pawn sliding after the montage). Must be called inside
-	// the movement update so it stays predicted.
+	// Zeroes the pawn's velocity when bZeroVelocityAtTraversalStart, else does nothing (only logs). Called by
+	// BP_GMCMovement at traversal start; the root motion replaces the velocity from the next move anyway, so zeroing
+	// only froze the first move. Must be called inside the movement update so it stays predicted.
 	UFUNCTION(BlueprintCallable, Category = "Traversal Warp")
 	void StopTraversalMovement();
 
@@ -858,12 +966,194 @@ public:
 	UFUNCTION(BlueprintPure, Category = "GMCMotion|GASP")
 	FRotator GetTargetOrientation() const;
 
+	// =====================================================================================
+	//  Stance collision (stand / crouch)
+	// =====================================================================================
+
+	// Drives the root collision toward the shape of DesiredStance (E_Stance byte: 0 Stand, 1 Crouch) and returns the
+	// stance the collision allows, to be written to the BP's bound Stance. Lerps the half height of the vertical capsule.
+	// Standing up only starts when a vertical capsule of the stand height fits (ECC_Pawn: attached actors ignore that
+	// channel), otherwise the crouch is kept. The returned stance switches as soon as the change is allowed, so the
+	// animation transition plays while the collision interpolates. bCollisionChanged is true when the collision moved
+	// this call (CL_DoNotCombineNextMove). While slope sliding the capsule lerps to CrouchHalfHeight (bottom kept on the
+	// slope) whatever DesiredStance is.
+	UFUNCTION(BlueprintCallable, Category = "GMCMotion|Stance")
+	uint8 UpdateStanceCollision(uint8 DesiredStance, float StandHalfHeight, float CrouchHalfHeight, float InterpSpeed,
+		float DeltaTime, bool bAdjustPosition, bool& bCollisionChanged);
+
+	// Instantly restores a vertical capsule of StandHalfHeight (current radius kept), e.g. when leaving the ground while
+	// crouched. Returns true if the collision changed. Does nothing while slope sliding (see UpdateStanceCollision).
+	UFUNCTION(BlueprintCallable, Category = "GMCMotion|Stance")
+	bool ResetStanceCollision(float StandHalfHeight);
+
+	// True when a vertical capsule of TargetHalfHeight (current radius) fits with its bottom at the current collision bottom.
+	UFUNCTION(BlueprintPure, Category = "GMCMotion|Stance")
+	bool HasRoomForVerticalCapsule(float TargetHalfHeight) const;
+
+	// True while the last UpdateStanceCollision call still moved the collision (stance transition in progress).
+	UFUNCTION(BlueprintPure, Category = "GMCMotion|Stance")
+	bool IsStanceCollisionChanging() const { return bStanceCollisionChanging; }
+
+	// =====================================================================================
+	//  Steep slope slide: involuntary slide down floors steeper than SlopeSlideStartAngle
+	// =====================================================================================
+	// GMC's grounded movement has no downhill force (the pawn can stand still on a 44 deg slope), and above
+	// WalkableFloorAngle it turns Airborne and falls along the slope. From SlopeSlideStartAngle this mode takes over
+	// instead: gravity along the floor plane minus friction, limited lateral steering, the pawn turned to the slide
+	// direction and kept on any surface (walkable or not). It ends under SlopeSlideStopAngle (GMC's static mode update
+	// then grounds the pawn) or when the floor is lost (Airborne). Decided in UpdateMovementModeDynamic from the move's
+	// floor and GMC state only, so prediction, replays and simulated proxies agree; GMC replicates the movement mode.
+	static constexpr EGMC_MovementMode SlopeSlideMovementMode = EGMC_MovementMode::Custom2;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Slope Slide")
+	bool bSlopeSlideEnabled = true;
+
+	// Floor angle (deg) from which the pawn starts sliding. Keep it under WalkableFloorAngle (45) to slide before GMC
+	// makes the pawn fall.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Slope Slide", meta = (ClampMin = "0", ClampMax = "89"))
+	float SlopeSlideStartAngle = 35.f;
+
+	// Floor angle (deg) under which the slide ends, once the speed is back under SlopeSlideExitSpeed. Lower than the
+	// start angle so the pawn doesn't flicker between walking and sliding around the threshold.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Slope Slide", meta = (ClampMin = "0", ClampMax = "89"))
+	float SlopeSlideStopAngle = 28.f;
+
+	// Run-out: on a gentler floor the slide goes on (slowed by the friction) until the speed drops under this (cm/s),
+	// instead of GMC's ground braking stopping a fast slide almost instantly.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Slope Slide", meta = (ClampMin = "0"))
+	float SlopeSlideExitSpeed = 250.f;
+
+	// Friction coefficient along the slope: deceleration = Friction * g * cos(angle). Gravity and friction balance at
+	// atan(Friction) (0.3 -> 17 deg): the slide accelerates on every slope it starts on (~320 cm/s^2 at 35 deg, ~400 at
+	// 40) and brakes the run-out on flatter ground (~290 cm/s^2 on the flat).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Slope Slide", meta = (ClampMin = "0", UIMax = "1"))
+	float SlopeSlideFriction = 0.3f;
+
+	// Friction coefficient of the run-out, once the floor is flatter than SlopeSlideStopAngle: ~780 cm/s^2 on the flat,
+	// a 3-4 m run-out from full speed (with SlopeSlideFriction the pawn kept sliding ~8 m past the bottom of a ramp).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Slope Slide", meta = (ClampMin = "0", UIMax = "2"))
+	float SlopeSlideRunOutFriction = 0.8f;
+
+	// Speed cap along the slope (cm/s).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Slope Slide", meta = (ClampMin = "0"))
+	float SlopeSlideMaxSpeed = 900.f;
+
+	// Lateral steering: the move input can only add speed across the slope, up to SlopeSlideSteerSpeed (cm/s), reached
+	// at SlopeSlideSteerAcceleration (cm/s^2). No braking and no climbing: the input along the fall line is ignored.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Slope Slide", meta = (ClampMin = "0"))
+	float SlopeSlideSteerSpeed = 250.f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Slope Slide", meta = (ClampMin = "0"))
+	float SlopeSlideSteerAcceleration = 800.f;
+
+	// Yaw rate (deg/s) turning the pawn to its slide direction (the slide animations face the way the body moves).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Slope Slide", meta = (ClampMin = "0"))
+	float SlopeSlideTurnRate = 360.f;
+
+	// Gap (cm) under the collision the slide keeps floor contact through (crests, bumps). Beyond it the pawn is Airborne.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Slope Slide", meta = (ClampMin = "0"))
+	float SlopeSlideSnapDistance = 15.f;
+
+	// Small obstacles (logs, rocks, kerbs) have steep sides too. A slide only starts if the floor this far (cm,
+	// horizontally) downhill of the contact is not walkable ground within the step height below it: otherwise the
+	// steep surface is a bump the pawn steps over. 0 disables the check.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Slope Slide", meta = (ClampMin = "0"))
+	float SlopeSlideBumpProbeDistance = 50.f;
+
+	UFUNCTION(BlueprintPure, Category = "GMCMotion|Slope Slide")
+	bool IsSlopeSliding() const { return GetMovementMode() == SlopeSlideMovementMode; }
+
+	// =====================================================================================
+	//  Ground velocity smoothing (GASP58 SmoothWalkingMode)
+	// =====================================================================================
+	// GASP58 walks with Mover's USmoothWalkingMode: the acceleration / braking (same values as ours) build an
+	// intermediate velocity, and the real velocity follows it through a critically damped spring (0.1 s). GMC applied
+	// them instantly: our starts reached 90 % of the run speed in 0.45 s instead of 0.56 s, stops slid 67 cm instead of
+	// 108, and the start anims (authored for the smoothed ramp) slid 1.5-2x more (gasp58_locomotion_parity_roadmap.md).
+	// Here GMC's own CalculateVelocity computes the intermediate velocity, then the spring gives the velocity. Grounded
+	// only, not under root motion, traversal or bot direct moves. The spring state is GMC-bound.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Ground Smoothing")
+	bool bSmoothGroundVelocity = true;
+
+	// Spring smoothing time (s) while speeding up / slowing down (GASP58 Acceleration/DecelerationSmoothingTime).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Ground Smoothing", meta = (ClampMin = "0"))
+	float GroundAccelerationSmoothingTime = 0.1f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Ground Smoothing", meta = (ClampMin = "0"))
+	float GroundDecelerationSmoothingTime = 0.1f;
+
+	// Rotates the intermediate velocity toward the input direction, keeping its length, before the acceleration
+	// (GASP58 TurningStrength 8). Without it, turning the camera while running left the intermediate velocity behind
+	// the input (GMC turns it through the ground friction only) and the speed fell to ~210 cm/s at 180 deg/s while the
+	// legs kept running (user report 2026-10-01). 0 disables.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Ground Smoothing", meta = (ClampMin = "0"))
+	float GroundTurningStrength = 8.f;
+
+	// On the ground, a speed above the max speed (sprint released, crouch while sprinting) slows down at the braking
+	// deceleration, like GASP58's walking mode (Deceleration = GaitChangeDeceleration 300 with an input, StoppingDeceleration
+	// 1000 without; BP_GMCMovement sets the same values as BrakingDecelerationGrounded). GMC used its over-max deceleration
+	// (10000): sprint -> run took ~0.02 s instead of 0.78 s and a sprint stop slid 144 cm instead of 229.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Ground Smoothing")
+	bool bGroundOverMaxSpeedUsesBraking = true;
+
+	// How fast the intermediate velocity is pulled back to the real one when something else changed it (collisions),
+	// scaled by how different they are (GASP58 OutsideInfluenceSmoothingTime).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Ground Smoothing", meta = (ClampMin = "0"))
+	float GroundOutsideInfluenceSmoothingTime = 0.05f;
+
+	// =====================================================================================
+	//  Ragdoll: the capsule follows the ragdoll (GASP58 BP_MovementMode_Ragdoll)
+	// =====================================================================================
+	// The ragdoll itself lives in UGMCGASPRagdollComponent (game module): server-authoritative bodies, pose streamed to
+	// the clients. This mode only keeps the capsule on the body. bRagdollMode is decided by the server and GMC-bound
+	// (ServerAuth), so every machine enters the mode at the same move. Each machine moves its capsule to the target its
+	// own ragdoll gives (SetRagdollCapsuleTarget): the clients' bodies follow the server's, so the capsules agree within a
+	// few cm and the location tolerance is widened meanwhile (see RagdollActorLocationTolerance) instead of correcting.
+	// Movement mode None (death) is never overridden.
+	static constexpr EGMC_MovementMode RagdollMovementMode = EGMC_MovementMode::Custom3;
+
+	// Server only: enters / leaves the ragdoll movement mode (GMC-bound, reaches the owner and the proxies). The request
+	// is copied into the bound value inside the next move (UpdateMovementModeDynamic): a bound value changed outside the
+	// movement cycle is overwritten by the server's end-of-move state for remote clients.
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "GMCMotion|Ragdoll")
+	void SetRagdollMode(bool bEnable) { bRagdollModeRequest = bEnable; }
+
+	UFUNCTION(BlueprintPure, Category = "GMCMotion|Ragdoll")
+	bool IsRagdollMode() const { return bRagdollMode; }
+
+	// Where the capsule should be (location = capsule centre, only the yaw of the rotation is used). Local, set every
+	// frame by the ragdoll component on every machine. bHold keeps the capsule where it is (get-up montage).
+	void SetRagdollCapsuleTarget(const FTransform& Target, bool bHold);
+	// Same, with the velocity the capsule has on its way (a montage path: smart objects). Without it the velocity is the
+	// move's jump to the target over the move's time, which explodes when the moves of several frames arrive in one batch
+	// (220 ms ping) and carried the pawn metres forward when the mode ended (walk exit of a bench, 2026-10-01).
+	void SetRagdollCapsuleTargetWithVelocity(const FTransform& Target, const FVector& InVelocity);
+	void ClearRagdollCapsuleTarget() { bHasRagdollCapsuleTarget = false; bHasRagdollCapsuleVelocity = false; }
+
+	// Location / rotation tolerances while the ragdoll drives the capsule (and for TraversalToleranceGraceTime after).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Ragdoll", meta = (ClampMin = "0"))
+	float RagdollActorLocationTolerance = 1000.0f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Ragdoll", meta = (ClampMin = "0"))
+	float RagdollActorRotationTolerance = 360.0f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Ragdoll", meta = (ClampMin = "0"))
+	float RagdollVelocityTolerance = 100000.0f;
+
+	// GMC never updates CurrentFloor on simulated proxies (GenSimulationTick runs no floor query), so the floor data the
+	// AnimInstance reads kept its initial value on the other clients: slope angle always 0 (no slope anims) and the slide
+	// pose projected on a plane through the world origin (the mesh under the slope). Runs the same floor query as the
+	// owner's moves, on simulated proxies only, while grounded or sliding and only after the pawn moved (a standing
+	// crowd costs nothing). Called by UGMCMotion_AnimInstance before it reads the floor (game thread).
+	void UpdateSimulatedProxyFloor();
+
 	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 
 protected:
 	// Runs the GASP pipeline (input acceleration, rotation mode, facing, direction, trajectory)
 	// AFTER the BP's PrePhysicsUpdate event completes (Jump, UpdateGait, SetGait, Update_Grounded_Physic).
 	virtual void PrePhysicsUpdate_Implementation(float DeltaSeconds) override;
+
+	// Regular GMC velocity, smoothed on the ground (see bSmoothGroundVelocity).
+	virtual void CalculateVelocity(float DeltaSeconds) override;
+	virtual float GetOverMaxSpeedDeceleration() const override;
 
 	// Computes ReplicatedSpeed, ReplicatedLocomotionAngle, and captures LastLandingVelocity.
 	// Runs in the GMC prediction loop so these values participate in replication.
@@ -905,6 +1195,7 @@ protected:
 	bool bTraversalToleranceDefaultsSaved = false;
 	bool bTraversalToleranceWidened = false;
 	float TraversalToleranceGraceRemaining = 0.0f;
+	float RagdollToleranceGraceRemaining = 0.0f;
 
 	// Copy of the base MoveThroughAir collision/slide resolution (SafeMove -> HandleImpact ->
 	// AdjustVelocityFromHitAirborne -> ComputeSlideVector -> TwoWallAdjust -> side-step) with EVERY
@@ -930,7 +1221,7 @@ protected:
 	// streamed-out / destroyed obstacle doesn't dangle.
 	TWeakObjectPtr<class UPrimitiveComponent> IgnoredObstacle;
 
-	// The raw (un-warped) animation horizontal velocity from the most recent traversal frame, captured
+	// The raw (un-warped) animation velocity (Z only used for an exit in the air) from the most recent traversal frame, captured
 	// in PreProcessRootMotion and handed to locomotion by RestoreTraversalExitVelocity on landing.
 	FVector TraversalExitVelocity = FVector::ZeroVector;
 
@@ -1043,4 +1334,78 @@ private:
 	int32 BI_Trj_TurnAngle = -1;
 	int32 BI_AngularVelocityRad = -1;
 	int32 BI_Downed = -1;
+
+	// Enters, keeps or leaves SlopeSlideMovementMode from the move's floor (see SlopeSlideStartAngle). Returns true when
+	// the slide owns the mode for this move (UpdateMovementModeDynamic then skips GMC's static update).
+	bool UpdateSlopeSlideMode(const FGMC_FloorParams& Floor);
+
+	// Floor normal and angle (deg) the slide uses. The line hit (straight under the collision centre) is preferred: on
+	// stairs it finds the flat tread where the shape hit finds the step edge. False when the shape is not within
+	// MAX_DISTANCE_TO_FLOOR + ExtraRange of a floor.
+	bool GetSlopeSlideFloor(const FGMC_FloorParams& Floor, float ExtraRange, FVector& OutNormal, float& OutAngle) const;
+
+	// True when the steep floor is a small obstacle rather than a slope (see SlopeSlideBumpProbeDistance): a line down,
+	// SlopeSlideBumpProbeDistance downhill of the shape contact, finds walkable ground within the step height below it.
+	bool IsSlopeSlideBump(const FGMC_FloorParams& Floor, const FVector& FloorNormal) const;
+
+	// PhysicsCustom for SlopeSlideMovementMode: velocity in the floor plane (gravity along the plane, friction, lateral
+	// steering, speed cap), yaw turned to the slide direction, swept move sliding along obstacles, then the floor is
+	// updated and the collision kept at GMC's floor distance.
+	void PhysicsSlopeSlide(float DeltaSeconds);
+
+	// Ragdoll mode (see RagdollMovementMode). GMC-bound, ServerAuth (BI_RagdollMode).
+	bool bRagdollMode = false;
+	int32 BI_RagdollMode = -1;
+	bool bRagdollModeRequest = false;
+	FTransform RagdollCapsuleTarget = FTransform::Identity;
+	bool bHasRagdollCapsuleTarget = false;
+	bool bHoldRagdollCapsule = false;
+	FVector RagdollCapsuleVelocity = FVector::ZeroVector;
+	bool bHasRagdollCapsuleVelocity = false;
+
+	// PhysicsCustom for RagdollMovementMode: puts the capsule on the ragdoll target (no sweep, the body already
+	// resolved the collisions), yaw only.
+	void PhysicsRagdoll(float DeltaSeconds);
+
+	// Location of the last UpdateSimulatedProxyFloor query (simulated proxies only).
+	FVector LastSimulatedFloorQueryLocation = FVector(UE_BIG_NUMBER);
+
+	// Ground velocity smoothing state (see bSmoothGroundVelocity), horizontal. Movement state carried from move to move:
+	// intermediate velocity (what the acceleration / braking give, unsmoothed), spring velocity output last move and its
+	// acceleration. Not valid (re-initialised from the velocity) after a move without smoothing.
+	FVector2D SmoothIntermediateVelocity = FVector2D::ZeroVector;
+	FVector2D SmoothSpringVelocity = FVector2D::ZeroVector;
+	FVector2D SmoothSpringAcceleration = FVector2D::ZeroVector;
+	bool bSmoothStateValid = false;
+	int32 BI_SmoothIntermediateVelocity = -1;
+	int32 BI_SmoothSpringVelocity = -1;
+	int32 BI_SmoothSpringAcceleration = -1;
+	int32 BI_SmoothStateValid = -1;
+
+	// True when this move's ground velocity is smoothed (see bSmoothGroundVelocity).
+	bool ShouldSmoothGroundVelocity() const;
+
+	// Post-jump-over speed carry (see TraversalExitOverSpeedDeceleration): set by RestoreTraversalExitVelocity, cleared
+	// in CalculateVelocity. Movement state carried from move to move.
+	bool bTraversalExitCarry = false;
+	int32 BI_TraversalExitCarry = -1;
+
+	// Horizontal speed at traversal start (captured by StopTraversalMovement), see TraversalEntrySpeedBlendTime.
+	float TraversalEntrySpeed = 0.0f;
+	int32 BI_TraversalEntrySpeed = -1;
+
+	// Last warped horizontal speed of a jump-over window and that window's end (montage time), see
+	// WarpWindowExitBlendTime. Movement state carried from move to move.
+	float LastWarpHorizontalSpeed = 0.0f;
+	float LastWarpWindowEnd = -1.0f;
+	int32 BI_LastWarpHorizontalSpeed = -1;
+	int32 BI_LastWarpWindowEnd = -1;
+
+	// BP_GMCMovement's ConfirmedTraversalStartTime (montage start position of the running traversal), found on first use.
+	mutable const FProperty* ConfirmedStartTimeProp = nullptr;
+	mutable bool bConfirmedStartTimePropSearched = false;
+	float GetConfirmedTraversalStartTime() const;
+
+	// Set by UpdateStanceCollision: the collision moved during the last call.
+	bool bStanceCollisionChanging = false;
 };

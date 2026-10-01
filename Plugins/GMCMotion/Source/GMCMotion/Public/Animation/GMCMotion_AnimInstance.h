@@ -4,6 +4,8 @@
 
 #include "CoreMinimal.h"
 #include "Animation/AnimInstance.h"
+#include "Animation/AnimExecutionContext.h"
+#include "Animation/AnimNodeReference.h"
 #include "Animation/TrajectoryTypes.h"
 #include "Components/GMCMotion.h"
 #include "Utility/GameplayElementMapping.h"
@@ -22,6 +24,8 @@ enum class EGMCMotion_MovementMode : uint8
 class AGMC_Pawn;
 class UGMCMotion;
 class UGMC_AbilitySystemComponent;
+class UAnimSequence;
+class UAnimationAsset;
 
 /**
  * Unified AnimInstance for GMCMotion pawns.
@@ -138,7 +142,9 @@ public:
 
 	// === Floor Hit ===
 
-	/** CurrentFloor.ShapeHitResult.Location */
+	/** CurrentFloor.ShapeHitResult.ImpactPoint: the contact point ON the floor (Get_SlideSlopeOffset projects the root on
+	 *  the floor plane through it). Not ShapeHit.Location, which is the collision centre at impact and lifted the slide
+	 *  pose ~70 cm off a 35 deg slope. */
 	UPROPERTY(BlueprintReadOnly, Category = "GMCMotion|Floor")
 	FVector FloorHitLocation = FVector::ZeroVector;
 
@@ -149,6 +155,33 @@ public:
 	/** CurrentFloor.ShapeHitResult.ImpactNormal */
 	UPROPERTY(BlueprintReadOnly, Category = "GMCMotion|Floor")
 	FVector FloorHitImpactNormal = FVector::UpVector;
+
+	// === Based Movement (moving platforms, GASP58 BasedMovementDelta) ===
+
+	/** World translation the movement base (GMC_Pawn::GetMovementBase) gave the mesh root since the last update. Zero
+	 *  without a base, on a base change, or when the base did not move. Fed to ApplyDeltaToOffsetRootBone
+	 *  (OnUpdate_OffsetRootBone) so the offset root follows the platform instead of trailing it, and to the foot
+	 *  placement CR "Ground Movement World Delta" input. */
+	UPROPERTY(BlueprintReadOnly, Category = "GMCMotion|Based Movement")
+	FVector BasedMovementDeltaTranslation = FVector::ZeroVector;
+
+	/** World rotation the movement base applied since the last update (identity without a base). */
+	UPROPERTY(BlueprintReadOnly, Category = "GMCMotion|Based Movement")
+	FQuat BasedMovementDeltaRotation = FQuat::Identity;
+
+	/** On Update function of the AnimGraph's Offset Root Bone node (GASP58 OnUpdate_OffsetRootBone): applies the movement
+	 *  base delta to the offset root. Native because the binding needs the prototype's const& parameters, which a
+	 *  Blueprint function created by script does not get. */
+	UFUNCTION(BlueprintCallable, Category = "GMCMotion|Based Movement", meta = (BlueprintThreadSafe))
+	void OnUpdateOffsetRootBone(const FAnimUpdateContext& Context, const FAnimNodeReference& Node);
+
+	// === Pose Search ===
+
+	/** Choosers whose PoseSearch columns get their search index requested at initialization. Editor only: the index of
+	 *  a chooser column's database is built asynchronously on first use, so the first state machine selections of a
+	 *  PIE session found nothing (NoValidAnim). Cooked builds ship the index. */
+	UPROPERTY(EditDefaultsOnly, Category = "GMCMotion|Pose Search")
+	TArray<TObjectPtr<UObject>> PoseSearchIndexWarmupChoosers;
 
 	// === Distance Matching ===
 	//
@@ -258,6 +291,14 @@ public:
 	UPROPERTY(BlueprintReadOnly, Category = "GMCMotion|GASP")
 	bool bGASPDowned = false;
 
+	// === Slopes ===
+	// Play length of any animation asset (sequence, montage, blend space at its default sample), 0 when null. Thread-safe
+	// counterpart of UAnimationAsset::GetPlayLength, which the thread-safe graphs cannot call on an object read from a
+	// variable. SetBlendStackAnimFromChooser uses it to normalize the time motion-matched on a loop sequence when the
+	// chooser swaps it for its slope blend space (the blend stack expects a 0..1 time for blend spaces).
+	UFUNCTION(BlueprintPure, Category = "GMCMotion|Animation", meta = (BlueprintThreadSafe))
+	static float GetAnimationAssetPlayLength(const UAnimationAsset* Asset);
+
 	// === GMAS Integration ===
 
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Ability System")
@@ -284,4 +325,9 @@ private:
 	void UpdateTrajectory();
 	void UpdateStrideWarpScale();
 	void UpdateGASPState();
+	void UpdateBasedMovement();
+	void WarmupPoseSearchIndexes() const;
+	// Movement base seen by the last update and its world transform then.
+	TWeakObjectPtr<const UPrimitiveComponent> LastMovementBase;
+	FTransform LastMovementBaseTransform = FTransform::Identity;
 };

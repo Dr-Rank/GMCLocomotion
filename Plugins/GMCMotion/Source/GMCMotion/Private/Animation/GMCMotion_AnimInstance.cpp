@@ -8,6 +8,16 @@
 #include "Components/GMCOrganicMovementComponent.h"
 #include "GMCAbilityComponent.h"
 #include "Utility/GMASUtilities.h"
+#include "Components/SkeletalMeshComponent.h"
+#include "DrawDebugHelpers.h"
+#include "Engine/World.h"
+#include "PoseSearch/PoseSearchDatabase.h"
+#include "AnimationWarpingLibrary.h"
+#include "BoneControllers/AnimNode_OffsetRootBone.h"
+#if WITH_EDITOR
+#include "PoseSearch/PoseSearchDerivedData.h"
+#include "UObject/UObjectHash.h"
+#endif
 
 // -----------------------------------------------------------------------------
 // Constructor / Destructor
@@ -35,6 +45,7 @@ void UGMCMotion_AnimInstance::NativeInitializeAnimation()
 	Super::NativeInitializeAnimation();
 
 	CacheComponentReferences();
+	WarmupPoseSearchIndexes();
 
 	// --- GMAS discovery ---
 	bool bShouldInitializeProperties = true;
@@ -186,8 +197,87 @@ void UGMCMotion_AnimInstance::NativeUpdateAnimation(float DeltaSeconds)
 	UpdateTrajectory();
 	UpdateStrideWarpScale();
 	UpdateGASPState();
+	UpdateBasedMovement();
 
 	BlueprintUpdateAnimation(DeltaSeconds);
+}
+
+// -----------------------------------------------------------------------------
+// Based Movement (moving platforms)
+// -----------------------------------------------------------------------------
+
+void UGMCMotion_AnimInstance::UpdateBasedMovement()
+{
+	BasedMovementDeltaTranslation = FVector::ZeroVector;
+	BasedMovementDeltaRotation = FQuat::Identity;
+
+	const UPrimitiveComponent* Base = OwnerPawn ? OwnerPawn->GetMovementBase() : nullptr;
+	if (!Base)
+	{
+		LastMovementBase.Reset();
+		return;
+	}
+
+	const FTransform BaseTransform = Base->GetComponentTransform();
+	if (LastMovementBase.Get() == Base)
+	{
+		// A point riding the base moves from P to (inverse old base, then new base) applied to P.
+		const FTransform Delta = LastMovementBaseTransform.Inverse() * BaseTransform;
+		if (const USkeletalMeshComponent* Mesh = GetSkelMeshComponent())
+		{
+			const FVector Root = Mesh->GetComponentLocation();
+			BasedMovementDeltaTranslation = Delta.TransformPosition(Root) - Root;
+		}
+		BasedMovementDeltaRotation = Delta.GetRotation();
+	}
+	LastMovementBase = Base;
+	LastMovementBaseTransform = BaseTransform;
+}
+
+void UGMCMotion_AnimInstance::OnUpdateOffsetRootBone(const FAnimUpdateContext& Context, const FAnimNodeReference& Node)
+{
+	if (BasedMovementDeltaTranslation.IsZero() && BasedMovementDeltaRotation.Equals(FQuat::Identity))
+	{
+		return;
+	}
+	// Same as UAnimationWarpingLibrary::ApplyDeltaToOffsetRootBone, which is not exported from its module (and neither is
+	// FAnimNode_OffsetRootBone::StaticStruct): the exported conversion checks the node type, then the inline accessors.
+	FOffsetRootBoneAnimNodeReference OffsetRootBone;
+	bool bResult = false;
+	UAnimationWarpingLibrary::ConvertToOffsetRootBoneNodePure(Node, OffsetRootBone, bResult);
+	if (!bResult)
+	{
+		return;
+	}
+	if (FAnimNode_Base* Base = OffsetRootBone.GetAnimNodePtr<FAnimNode_Base>())
+	{
+		FAnimNode_OffsetRootBone* OffsetRoot = static_cast<FAnimNode_OffsetRootBone*>(Base);
+		OffsetRoot->SetOffsetRootTranslation(OffsetRoot->GetOffsetRootTranslation() + BasedMovementDeltaTranslation);
+		OffsetRoot->SetOffsetRootRotation(BasedMovementDeltaRotation * OffsetRoot->GetOffsetRootRotation());
+	}
+}
+
+void UGMCMotion_AnimInstance::WarmupPoseSearchIndexes() const
+{
+#if WITH_EDITOR
+	// A chooser's PoseSearch column databases are subobjects of its root chooser.
+	for (const UObject* Chooser : PoseSearchIndexWarmupChoosers)
+	{
+		if (!Chooser)
+		{
+			continue;
+		}
+		TArray<UObject*> Inner;
+		GetObjectsWithOuter(Chooser, Inner, true);
+		for (const UObject* Object : Inner)
+		{
+			if (const UPoseSearchDatabase* Database = Cast<UPoseSearchDatabase>(Object))
+			{
+				UE::PoseSearch::FAsyncPoseSearchDatabasesManagement::RequestAsyncBuildIndex(Database, UE::PoseSearch::ERequestAsyncBuildFlag::ContinueRequest);
+			}
+		}
+	}
+#endif
 }
 
 // -----------------------------------------------------------------------------
@@ -209,14 +299,22 @@ void UGMCMotion_AnimInstance::UpdateLocomotionState()
 	ActorTransformGMC = MovementComponent->GetActorTransform_GMC();
 	InputAcceleration = MovementComponent->GetInputAcceleration();
 	GMC_Velocity = MovementComponent->GetVelocity();
-	// Map GMC movement mode to GASP E_MovementMode.
-	// Sliding is BP-driven (set externally via BlueprintReadWrite); C++ handles the rest.
+	// Map GMC movement mode to GASP E_MovementMode. Sliding = the steep slope slide (UGMCMotion::SlopeSlideMovementMode);
+	// the movement mode is GMC-replicated, so simulated proxies get it too.
 	if (MovementComponent->bTraversalWarpActive)
 	{
 		E_MovementMode = EGMCMotion_MovementMode::Traversing;
 	}
-	else if (MovementComponent->GetMovementMode() == EGMC_MovementMode::Grounded)
+	else if (MovementComponent->IsSlopeSliding())
 	{
+		E_MovementMode = EGMCMotion_MovementMode::Sliding;
+	}
+	else if (MovementComponent->GetMovementMode() == EGMC_MovementMode::Grounded
+		|| MovementComponent->GetMovementMode() == UGMCMotion::RagdollMovementMode || MovementComponent->IsRagdollMode())
+	{
+		// The ragdoll mode counts as on the ground (GASP58's locomotion stays grounded while ragdolling): mapped to InAir,
+		// the locomotion under the ragdoll played the fall loop, then the land at the get-up, which showed through the
+		// get-up montage's blend-in (jolt at the start of the get-up, user 2026-09-30, seen in the Rewind Debugger).
 		E_MovementMode = EGMCMotion_MovementMode::OnGround;
 	}
 	else
@@ -235,19 +333,21 @@ void UGMCMotion_AnimInstance::UpdateLocomotionState()
 	LocomotionAngle = MovementComponent->ReplicatedLocomotionAngle;
 
 	bIsOnGround = E_MovementMode == EGMCMotion_MovementMode::OnGround;
-	bIsInAir = !bIsOnGround;
+	bIsInAir = !bIsOnGround && E_MovementMode != EGMCMotion_MovementMode::Sliding;
 	LastLandingVelocity = MovementComponent->LastLandingVelocity;
 	LandVelocityZ = LastLandingVelocity.Z;
 
 	ComponentYawRate = MovementComponent->GetCurrentComponentYawRate();
 	AnimAcceleration = MovementComponent->GetCurrentAnimationAcceleration();
 
-	// Floor hit data from the movement component's current floor trace.
+	// Floor hit data from the movement component's current floor trace (queried here on simulated proxies, where GMC
+	// doesn't update it).
+	MovementComponent->UpdateSimulatedProxyFloor();
 	const FGMC_FloorParams& Floor = MovementComponent->GetCurrentFloor();
 	if (Floor.HasValidShapeData())
 	{
 		const FHitResult& ShapeHit = Floor.ShapeHit();
-		FloorHitLocation = ShapeHit.Location;
+		FloorHitLocation = ShapeHit.ImpactPoint;
 		FloorHitNormal = ShapeHit.Normal;
 		FloorHitImpactNormal = ShapeHit.ImpactNormal;
 	}
@@ -390,3 +490,13 @@ void UGMCMotion_AnimInstance::UpdateGASPState()
 			Speed, GroundSpeed, LocomotionAngle);
 	}
 }
+
+// -----------------------------------------------------------------------------
+// Slopes
+// -----------------------------------------------------------------------------
+
+float UGMCMotion_AnimInstance::GetAnimationAssetPlayLength(const UAnimationAsset* Asset)
+{
+	return Asset ? Asset->GetPlayLength() : 0.f;
+}
+

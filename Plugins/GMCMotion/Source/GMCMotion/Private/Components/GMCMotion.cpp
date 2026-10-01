@@ -3,8 +3,11 @@
 #include "Components/GMCMotion.h"
 #include "GMCMotionLog.h"
 #include "Animation/AnimMontage.h"
+#include "Animation/AnimSequence.h"
+#include "Misc/ScopeExit.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Components/CapsuleComponent.h"
+#include "Components/GMCFlatCapsuleComponent.h"
 #include "Components/PrimitiveComponent.h"
 #include "Engine/World.h"
 #include "CollisionQueryParams.h"
@@ -20,9 +23,23 @@
 #include "ReferenceSkeleton.h"
 #include "UObject/UnrealType.h"
 #include "Curves/CurveFloat.h"
+#include "Math/SpringMath.h"
 
 void UGMCMotion::PhysicsCustom_Implementation(float DeltaSeconds)
 {
+	if (GetMovementMode() == RagdollMovementMode)
+	{
+		PhysicsRagdoll(DeltaSeconds);
+		return;
+	}
+
+	if (GetMovementMode() == SlopeSlideMovementMode)
+	{
+		PhysicsSlopeSlide(DeltaSeconds);
+		return;
+	}
+
+	// Traversal (Custom1).
 	// Mirror PhysicsAirborne exactly, only swapping the move call for the no-landing variant.
 	// Velocity here is the root-motion velocity set by the previous frame's MontageUpdate (the warp's
 	// per-frame delta), so this integration moves the capsule along the warped path just like Airborne.
@@ -44,6 +61,28 @@ bool UGMCMotion::UpdateMovementModeDynamic_Implementation(FGMC_FloorParams& Floo
 	// Widen GMC's network error tolerances during the traversal (+ grace) so the warped move's legitimate
 	// client/server divergence doesn't trip a correction; restored after. Server still validates (bounded).
 	UpdateTraversalErrorTolerances(DeltaSeconds);
+
+	// Ragdoll: held for as long as the server says so (bRagdollMode is GMC-bound), except over death (None).
+	if (PawnOwner && PawnOwner->HasAuthority())
+	{
+		bRagdollMode = bRagdollModeRequest;
+	}
+	if (GetMovementMode() != EGMC_MovementMode::None)
+	{
+		if (bRagdollMode)
+		{
+			if (GetMovementMode() != RagdollMovementMode)
+			{
+				SetMovementMode(RagdollMovementMode);
+			}
+			return true;
+		}
+		if (GetMovementMode() == RagdollMovementMode)
+		{
+			// Back to the base update, which grounds the pawn on the floor under the capsule.
+			SetMovementMode(EGMC_MovementMode::Airborne);
+		}
+	}
 
 	if (bTraversalWarpActive)
 	{
@@ -130,7 +169,223 @@ bool UGMCMotion::UpdateMovementModeDynamic_Implementation(FGMC_FloorParams& Floo
 		bPrevTraversalWarpActive_Gate = false;
 	}
 
+	if (UpdateSlopeSlideMode(Floor))
+	{
+		return true;
+	}
+
 	return Super::UpdateMovementModeDynamic_Implementation(Floor, DeltaSeconds);
+}
+
+// -----------------------------------------------------------------------------
+// Steep slope slide (SlopeSlideMovementMode)
+// -----------------------------------------------------------------------------
+
+bool UGMCMotion::GetSlopeSlideFloor(const FGMC_FloorParams& Floor, float ExtraRange, FVector& OutNormal, float& OutAngle) const
+{
+	const float ContactRange = MAX_DISTANCE_TO_FLOOR + FMath::Max(ExtraRange, 0.f);
+	if (!Floor.HasValidShapeData() || !Floor.ShapeHit().IsValidBlockingHit() || Floor.GetShapeDistanceToFloor() > ContactRange)
+	{
+		return false;
+	}
+
+	// The line starts under the collision centre, which on a slope is further from the plane than the shape's contact
+	// point (radius * (1 / cos(angle) - 1): 14.5 cm for a 35 cm radius at 45 deg), hence the extra margin.
+	constexpr float LineMargin = 25.f;
+	const bool bUseLine = Floor.HasValidLineData()
+		&& Floor.LineHit().IsValidBlockingHit()
+		&& Floor.GetLineDistanceToFloor() <= ContactRange + LineMargin;
+
+	OutNormal = (bUseLine ? Floor.LineHit() : Floor.ShapeHit()).ImpactNormal.GetSafeNormal();
+	if (OutNormal.IsNearlyZero())
+	{
+		return false;
+	}
+	OutAngle = FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(OutNormal.Z, -1., 1.)));
+	return true;
+}
+
+bool UGMCMotion::IsSlopeSlideBump(const FGMC_FloorParams& Floor, const FVector& FloorNormal) const
+{
+	const UPrimitiveComponent* Primitive = Cast<UPrimitiveComponent>(UpdatedComponent);
+	UWorld* World = GetWorld();
+	const FVector Downhill = FloorNormal.GetSafeNormal2D();
+	if (SlopeSlideBumpProbeDistance <= 0.f || !Primitive || !World || Downhill.IsNearlyZero() || !Floor.HasValidShapeData())
+	{
+		return false;
+	}
+
+	FCollisionQueryParams Params(SCENE_QUERY_STAT(SlopeSlideBumpProbe), false, GetOwner());
+	FCollisionResponseParams Response;
+	Primitive->InitSweepCollisionParams(Params, Response);
+	if (const AActor* Owner = GetOwner())
+	{
+		TArray<AActor*> Attached;
+		Owner->GetAttachedActors(Attached, true, true);
+		Params.AddIgnoredActors(Attached);
+	}
+
+	// A little above the contact (the ground past a bump is lower), down to the step height under it.
+	const FVector Contact = Floor.ShapeHit().ImpactPoint;
+	const FVector Probe = Contact + Downhill * SlopeSlideBumpProbeDistance;
+	const FVector Start(Probe.X, Probe.Y, Contact.Z + 5.);
+	const FVector End(Probe.X, Probe.Y, Contact.Z - GetMaxStepUpHeight());
+	FHitResult Hit;
+	if (!World->LineTraceSingleByChannel(Hit, Start, End, Primitive->GetCollisionObjectType(), Params, Response) || Hit.bStartPenetrating)
+	{
+		// Nothing within the step height (a real slope, or a drop): slide.
+		return false;
+	}
+	// Still the steep surface there: a slope at least SlopeSlideBumpProbeDistance long.
+	return Hit.ImpactNormal.Z >= FMath::Cos(FMath::DegreesToRadians(SlopeSlideStartAngle));
+}
+
+bool UGMCMotion::UpdateSlopeSlideMode(const FGMC_FloorParams& Floor)
+{
+	const bool bSliding = GetMovementMode() == SlopeSlideMovementMode;
+
+	const bool bAllowed = bSlopeSlideEnabled
+		&& !Downed
+		&& GetRootCollisionShape() != EGMC_CollisionShape::HorizontalCapsule
+		&& IsAffectedByGravity()
+		&& CurrentImmersionDepth < BuoyantStateMinImmersion;
+
+	FVector FloorNormal;
+	float FloorAngle = 0.f;
+	const bool bHasFloor = bAllowed && GetSlopeSlideFloor(Floor, bSliding ? SlopeSlideSnapDistance : 0.f, FloorNormal, FloorAngle);
+
+	bool bWantsSlide = false;
+	if (bHasFloor)
+	{
+		if (bSliding)
+		{
+			// Steep enough, or still running out (see SlopeSlideExitSpeed).
+			bWantsSlide = FloorAngle >= SlopeSlideStopAngle || Velocity.SizeSquared() > FMath::Square(SlopeSlideExitSpeed);
+		}
+		else if (IsMovingOnGround())
+		{
+			bWantsSlide = FloorAngle >= SlopeSlideStartAngle && !bReceivedUpwardForce;
+		}
+		else if (IsAirborne())
+		{
+			// Landing on (or falling along) a steep slope, including unwalkable ones GMC would keep the pawn airborne on.
+			bWantsSlide = FloorAngle >= SlopeSlideStartAngle && !bReceivedUpwardForce && Velocity.Z <= 0.;
+		}
+
+		// Entry only: the side of a log or a rock is steep but short, the pawn steps over it.
+		if (bWantsSlide && !bSliding && IsSlopeSlideBump(Floor, FloorNormal))
+		{
+			bWantsSlide = false;
+		}
+	}
+
+	bIsSliding = bWantsSlide;
+	if (!bWantsSlide)
+	{
+		// Leaving the slide (or not sliding): GMC's static update grounds the pawn on a walkable floor, else Airborne.
+		return false;
+	}
+
+	if (!bSliding)
+	{
+		SetMovementMode(SlopeSlideMovementMode);
+	}
+	return true;
+}
+
+void UGMCMotion::UpdateSimulatedProxyFloor()
+{
+	if (!IsSimulatedProxy() || !UpdatedComponent)
+	{
+		return;
+	}
+
+	const EGMC_MovementMode Mode = GetMovementMode();
+	if (Mode != EGMC_MovementMode::Grounded && Mode != SlopeSlideMovementMode)
+	{
+		return;
+	}
+
+	const FVector Location = UpdatedComponent->GetComponentLocation();
+	if (CurrentFloor.HasValidShapeData() && FVector::DistSquared(Location, LastSimulatedFloorQueryLocation) < 1.)
+	{
+		return;
+	}
+	LastSimulatedFloorQueryLocation = Location;
+
+	// Query only (no auto adjust): the simulated pawn's location stays GMC's interpolated one.
+	UpdateFloor(CurrentFloor, FVector::DownVector, FloorTraceLength, FloorUpdateTolerance, FloorTraceShapeScale, false, true);
+}
+
+void UGMCMotion::PhysicsSlopeSlide(float DeltaSeconds)
+{
+	FVector FloorNormal = FVector::UpVector;
+	float FloorAngle = 0.f;
+	if (!GetSlopeSlideFloor(CurrentFloor, SlopeSlideSnapDistance, FloorNormal, FloorAngle))
+	{
+		FloorNormal = FVector::UpVector;
+	}
+
+	const FVector Gravity = GetGravity();
+	const FVector GravityAlongFloor = Gravity - (Gravity | FloorNormal) * FloorNormal;
+	const FVector FallLine = GravityAlongFloor.GetSafeNormal();
+
+	// Velocity in the floor plane, pulled down the fall line, slowed by friction.
+	FVector NewVelocity = Velocity - (Velocity | FloorNormal) * FloorNormal;
+	NewVelocity += GravityAlongFloor * DeltaSeconds;
+
+	const double Speed = NewVelocity.Size();
+	if (Speed > UE_KINDA_SMALL_NUMBER)
+	{
+		const float Friction = FloorAngle < SlopeSlideStopAngle ? SlopeSlideRunOutFriction : SlopeSlideFriction;
+		const double FrictionDeceleration = Friction * FMath::Abs(Gravity | FloorNormal);
+		NewVelocity *= FMath::Max(Speed - FrictionDeceleration * DeltaSeconds, 0.) / Speed;
+	}
+
+	// Lateral steering only: the input along the fall line (braking or climbing) is ignored.
+	if (!FallLine.IsNearlyZero())
+	{
+		const FVector Across = FVector::CrossProduct(FloorNormal, FallLine).GetSafeNormal();
+		const float SteerInput = FMath::Clamp(static_cast<float>(GetProcessedInputVector() | Across), -1.f, 1.f);
+		const float AcrossSpeed = NewVelocity | Across;
+		const float NewAcrossSpeed = FMath::FInterpConstantTo(AcrossSpeed, SteerInput * SlopeSlideSteerSpeed, DeltaSeconds, SlopeSlideSteerAcceleration);
+		NewVelocity += Across * (NewAcrossSpeed - AcrossSpeed);
+	}
+
+	NewVelocity = NewVelocity.GetClampedToMaxSize(SlopeSlideMaxSpeed);
+	UpdateVelocity(NewVelocity, DeltaSeconds);
+
+	// Face the slide direction (yaw only).
+	FRotator NewRotation = UpdatedComponent->GetComponentRotation();
+	if (NewVelocity.SizeSquared2D() > FMath::Square(10.))
+	{
+		const float TargetYaw = FVector(NewVelocity.X, NewVelocity.Y, 0.).Rotation().Yaw;
+		NewRotation.Yaw = FMath::FixedTurn(NewRotation.Yaw, TargetYaw, SlopeSlideTurnRate * DeltaSeconds);
+	}
+	const FQuat NewQuat = FRotator(0., NewRotation.Yaw, 0.).Quaternion();
+
+	const FVector LocationDelta = NewVelocity * DeltaSeconds;
+	FHitResult Hit;
+	SafeMoveUpdatedComponent(LocationDelta, NewQuat, true, Hit);
+	if (Hit.IsValidBlockingHit())
+	{
+		HandleImpact(Hit, DeltaSeconds, LocationDelta);
+		// Drop the velocity going into the obstacle, then slide along it for the rest of the move.
+		const double IntoHit = Velocity | Hit.Normal;
+		if (IntoHit < 0.)
+		{
+			UpdateVelocity(Velocity - IntoHit * Hit.Normal, DeltaSeconds);
+		}
+		SlideAlongSurface(LocationDelta, 1.f - Hit.Time, Hit.Normal, Hit, true);
+	}
+
+	// Stay on the surface (walkable or not) over crests and bumps; beyond the snap distance the next mode update makes
+	// the pawn Airborne.
+	UpdateFloor(CurrentFloor, FVector::DownVector, FloorTraceLength, FloorUpdateTolerance, FloorTraceShapeScale, false, true);
+	if (CurrentFloor.HasValidShapeData() && CurrentFloor.GetShapeDistanceToFloor() <= MAX_DISTANCE_TO_FLOOR + SlopeSlideSnapDistance)
+	{
+		MaintainDistanceToFloor(CurrentFloor, true);
+	}
 }
 
 bool UGMCMotion::IsValidLandingSpot(const FHitResult& Hit)
@@ -174,8 +429,8 @@ void UGMCMotion::UpdateTraversalErrorTolerances(float DeltaSeconds)
 		bTraversalToleranceDefaultsSaved = true;
 	}
 
-	// Grace: keep the widened tolerances for a bit after the traversal ends so in-flight (RTT-late) client
-	// validations of the last traversal moves still use the wide tolerance.
+	// Grace: keep the widened tolerances for a bit after the traversal / ragdoll ends so in-flight (RTT-late) client
+	// validations of the last moves still use the wide tolerance.
 	if (bTraversalWarpActive)
 	{
 		TraversalToleranceGraceRemaining = TraversalToleranceGraceTime;
@@ -184,24 +439,36 @@ void UGMCMotion::UpdateTraversalErrorTolerances(float DeltaSeconds)
 	{
 		TraversalToleranceGraceRemaining = FMath::Max(0.0f, TraversalToleranceGraceRemaining - DeltaSeconds);
 	}
-
-	const bool bWiden = bTraversalWarpActive || TraversalToleranceGraceRemaining > 0.0f;
-
-	if (bWiden && !bTraversalToleranceWidened)
+	// The ragdoll's grace is longer: the get-up leaves each machine's capsule where its own body lay.
+	if (bRagdollMode)
 	{
-		Tol.ActorLocation = TraversalActorLocationTolerance;
-		Tol.ActorRotation = TraversalActorRotationTolerance;
-		Tol.LinearVelocity = TraversalLinearVelocityTolerance;
-		Tol.AngularVelocity = TraversalAngularVelocityTolerance;
-		bTraversalToleranceWidened = true;
-		if (bDebugTraversalWarp)
-		{
-			UE_LOG(LogGMCMotion, Warning, TEXT("[TTol] WIDEN loc=%.0f rot=%.0f lvel=%.0f avel=%.0f"),
-				TraversalActorLocationTolerance, TraversalActorRotationTolerance,
-				TraversalLinearVelocityTolerance, TraversalAngularVelocityTolerance);
-		}
+		RagdollToleranceGraceRemaining = FMath::Max(1.0f, TraversalToleranceGraceTime);
 	}
-	else if (!bWiden && bTraversalToleranceWidened)
+	else if (RagdollToleranceGraceRemaining > 0.0f)
+	{
+		RagdollToleranceGraceRemaining = FMath::Max(0.0f, RagdollToleranceGraceRemaining - DeltaSeconds);
+	}
+
+	const bool bRagdollWiden = bRagdollMode || RagdollToleranceGraceRemaining > 0.0f;
+	const bool bWiden = bRagdollWiden || bTraversalWarpActive || TraversalToleranceGraceRemaining > 0.0f;
+
+	if (bWiden)
+	{
+		const float Loc = bRagdollWiden ? RagdollActorLocationTolerance : TraversalActorLocationTolerance;
+		const float Rot = bRagdollWiden ? RagdollActorRotationTolerance : TraversalActorRotationTolerance;
+		const float LVel = bRagdollWiden ? RagdollVelocityTolerance : TraversalLinearVelocityTolerance;
+		const float AVel = bRagdollWiden ? RagdollVelocityTolerance : TraversalAngularVelocityTolerance;
+		if (bDebugTraversalWarp && (!bTraversalToleranceWidened || Tol.ActorLocation != Loc))
+		{
+			UE_LOG(LogGMCMotion, Warning, TEXT("[TTol] WIDEN loc=%.0f rot=%.0f lvel=%.0f avel=%.0f"), Loc, Rot, LVel, AVel);
+		}
+		Tol.ActorLocation = Loc;
+		Tol.ActorRotation = Rot;
+		Tol.LinearVelocity = LVel;
+		Tol.AngularVelocity = AVel;
+		bTraversalToleranceWidened = true;
+	}
+	else if (bTraversalToleranceWidened)
 	{
 		Tol.ActorLocation = SavedActorLocationTolerance;
 		Tol.ActorRotation = SavedActorRotationTolerance;
@@ -214,6 +481,45 @@ void UGMCMotion::UpdateTraversalErrorTolerances(float DeltaSeconds)
 				SavedActorLocationTolerance, SavedActorRotationTolerance,
 				SavedLinearVelocityTolerance, SavedAngularVelocityTolerance);
 		}
+	}
+}
+
+void UGMCMotion::SetRagdollCapsuleTarget(const FTransform& Target, bool bHold)
+{
+	RagdollCapsuleTarget = Target;
+	bHasRagdollCapsuleTarget = true;
+	bHoldRagdollCapsule = bHold;
+	bHasRagdollCapsuleVelocity = false;
+}
+
+void UGMCMotion::SetRagdollCapsuleTargetWithVelocity(const FTransform& Target, const FVector& InVelocity)
+{
+	SetRagdollCapsuleTarget(Target, false);
+	RagdollCapsuleVelocity = InVelocity;
+	bHasRagdollCapsuleVelocity = true;
+}
+
+void UGMCMotion::PhysicsRagdoll(float DeltaSeconds)
+{
+	Velocity = FVector::ZeroVector;
+	if (!bHasRagdollCapsuleTarget || bHoldRagdollCapsule || !UpdatedComponent)
+	{
+		return;
+	}
+
+	const FVector Current = UpdatedComponent->GetComponentLocation();
+	const FVector Delta = RagdollCapsuleTarget.GetLocation() - Current;
+	FRotator NewRotation = UpdatedComponent->GetComponentRotation();
+	NewRotation.Yaw = RagdollCapsuleTarget.Rotator().Yaw;
+	// No sweep: the ragdoll body already resolved the collisions, the capsule only has to stay on it.
+	MoveUpdatedComponent(Delta, NewRotation.Quaternion(), false);
+	if (bHasRagdollCapsuleVelocity)
+	{
+		Velocity = RagdollCapsuleVelocity;
+	}
+	else if (DeltaSeconds > UE_KINDA_SMALL_NUMBER)
+	{
+		Velocity = Delta / DeltaSeconds;
 	}
 }
 
@@ -360,7 +666,8 @@ void UGMCMotion::PreProcessRootMotion(
 		if (!bInTailPhase)
 		{
 			const FVector RawT = InOutRootMotionParams.GetRootMotionTransform().GetTranslation();
-			TraversalExitVelocity = FVector(RawT.X, RawT.Y, 0.0) / FMath::Max(DeltaSeconds, (float)KINDA_SMALL_NUMBER);
+			// Z kept for an exit in the air (see RestoreTraversalExitVelocity).
+			TraversalExitVelocity = RawT / FMath::Max(DeltaSeconds, (float)KINDA_SMALL_NUMBER);
 		}
 	}
 
@@ -453,12 +760,10 @@ void UGMCMotion::PreProcessRootMotion(
 			return;
 		}
 
-		// PRE-WINDOW phase of a JUMP-OVER: before the first warp window opens, suppress
-		// horizontal root motion so the capsule doesn't run through the collision-disabled
-		// obstacle (Custom1 uses bSweep=false). Working hurdle anims have their first window
-		// at/near t=0, so this is a no-op. Anims with a late first window (long pre-jump
-		// run-up) would otherwise push the capsule through the obstacle before the warp can
-		// redirect it upward.
+		// PRE-WINDOW phase of a JUMP-OVER: before the first warp window opens, the run-up root motion must not
+		// carry the capsule through the obstacle (Custom1 uses bSweep=false). The GASP "run" hurdles start around
+		// 0.28 s with their first window around 0.51 s, so this phase is real: keep the run-up and stop it short of
+		// the front face (bKeepPreWindowRunUp), or zero it (old behaviour, freezes the capsule until the window).
 		if (bIsJumpOver)
 		{
 			const float FirstStart = GetFirstWarpWindowStart(Montage);
@@ -466,6 +771,110 @@ void UGMCMotion::PreProcessRootMotion(
 			{
 				FTransform PreRM = InOutRootMotionParams.GetRootMotionTransform();
 				FVector PreT = PreRM.GetTranslation();
+
+				if (bKeepPreWindowRunUp && !WarpFrontLedge.IsNearlyZero())
+				{
+					const FVector Cur = UpdatedComponent->GetComponentLocation();
+					FVector Into(-WarpFrontLedgeNormal.X, -WarpFrontLedgeNormal.Y, 0.0);
+					if (Into.IsNearlyZero())
+					{
+						Into = FVector(WarpFrontLedge.X - Cur.X, WarpFrontLedge.Y - Cur.Y, 0.0);
+					}
+					Into = Into.GetSafeNormal();
+					if (!Into.IsNearlyZero())
+					{
+						float Radius = 0.0f;
+						if (const UCapsuleComponent* Capsule = Cast<UCapsuleComponent>(UpdatedComponent))
+						{
+							Radius = Capsule->GetScaledCapsuleRadius();
+						}
+						// FrontLedge lies on the front face: distance from the capsule centre to the face plane.
+						const double ToFace = FVector::DotProduct(WarpFrontLedge - Cur, Into);
+						const double Allowed = FMath::Max(0.0, ToFace - Radius - PreWindowFaceClearance);
+						const float FromTime = FMath::Max(0.0f, Position - MontageDelta);
+						auto RunUpAlong = [&](float ToTime) -> double
+						{
+							const FTransform Local = Montage->ExtractRootMotionFromTrackRange(FromTime, ToTime, FAnimExtractContext());
+							return FVector::DotProduct(SkeletalMesh->ConvertLocalRootMotionToWorld(Local).GetTranslation(), Into);
+						};
+						FVector Horizontal(PreT.X, PreT.Y, 0.0);
+						const double Along = FVector::DotProduct(Horizontal, Into);
+						double Scale = 1.0;
+
+						// Pace the run-up for the whole approach up to the first window's end (same ratio the window's
+						// convergent warp will then use -> no speed step when it opens).
+						FVector FirstTarget;
+						float FirstEnd = 0.0f;
+						FName FirstBone, FirstName;
+						if (bPreWindowMatchFirstWindow
+							&& GetActiveWarpTarget(Montage, FirstStart + KINDA_SMALL_NUMBER, FirstTarget, FirstEnd, FirstBone, FirstName))
+						{
+							if (!FirstBone.IsNone())
+							{
+								// Same inset as the window: the anim's root -> warp-bone offset at its end (bReachWarpUsesAnimOffset),
+								// at least the capsule radius out from the face.
+								double OutFromFace = Radius;
+								if (bReachWarpUsesAnimOffset && FirstName.ToString().TrimStartAndEnd().Equals(TEXT("FrontLedge"), ESearchCase::IgnoreCase))
+								{
+									const FQuat MeshQuat = SkeletalMesh->GetRelativeRotation().Quaternion();
+									OutFromFace = FMath::Max((double)Radius, -MeshQuat.RotateVector(ComputeRootMinusBoneOffset(Montage, FirstEnd, FirstBone)).X);
+								}
+								FirstTarget += -Into * OutFromFace;
+							}
+							const double ToTarget = FVector::DotProduct(FirstTarget - Cur, Into);
+							const double RunUpToEnd = RunUpAlong(FirstEnd);
+							if (RunUpToEnd > 1.0)
+							{
+								// Recomputed every frame, so it converges: a slower entry (entry blend below) is made up
+								// over the rest of the run-up instead of by the window in one go.
+								Scale = FMath::Clamp(ToTarget / RunUpToEnd, 0.0, (double)FMath::Min(PreWindowMaxScale, MaxWarpScale));
+							}
+						}
+
+						// Room left before the face (late jump press): the run-up until the window opens must fit.
+						const double RunUpLeft = RunUpAlong(FirstStart);
+						if (RunUpLeft * Scale > Allowed)
+						{
+							Scale = RunUpLeft > KINDA_SMALL_NUMBER ? Allowed / RunUpLeft : 0.0;
+						}
+
+						// Entry blend: from the speed the pawn entered with to the paced run-up speed.
+						double FrameScale = Scale;
+						const float StartTime = GetConfirmedTraversalStartTime();
+						if (TraversalEntrySpeedBlendTime > 0.0f && StartTime >= 0.0f && Along > KINDA_SMALL_NUMBER && DeltaSeconds > KINDA_SMALL_NUMBER)
+						{
+							// Done by the time the window opens at the latest (late press: short pre-window), so the
+							// window starts at the paced speed instead of stepping down to it.
+							const float BlendTime = FMath::Min(TraversalEntrySpeedBlendTime, FMath::Max(FirstStart - StartTime, 0.02f));
+							const double Alpha = FMath::Clamp((Position - StartTime) / BlendTime, 0.0f, 1.0f);
+							const double FrameSpeed = Along / DeltaSeconds;
+							const double Desired = FMath::Lerp((double)TraversalEntrySpeed, FrameSpeed * Scale, Alpha);
+							FrameScale = Desired / FrameSpeed;
+						}
+						if (Along > 0.0)
+						{
+							Horizontal -= Into * (Along * (1.0 - FrameScale));
+						}
+						const double AlongScaled = FVector::DotProduct(Horizontal, Into);
+						if (AlongScaled > Allowed)
+						{
+							Horizontal -= Into * (AlongScaled - Allowed);
+						}
+
+						if (bDebugTraversalWarp)
+						{
+							UE_LOG(LogGMCMotion, Warning,
+								TEXT("[TWarp] %s PRE-WINDOW RUN-UP pos=%.3f firstWarp=%.3f toFace=%.1f | rootMotion=(%.1f,%.1f) -> (%.1f,%.1f)"),
+								*GetNameSafe(Montage), Position, FirstStart, ToFace, PreT.X, PreT.Y, Horizontal.X, Horizontal.Y);
+						}
+
+						PreT.X = Horizontal.X;
+						PreT.Y = Horizontal.Y;
+						PreRM.SetTranslation(PreT);
+						InOutRootMotionParams.Set(PreRM);
+						return;
+					}
+				}
 
 				if (bDebugTraversalWarp)
 				{
@@ -486,6 +895,24 @@ void UGMCMotion::PreProcessRootMotion(
 		// the character high above the obstacle between FrontLedge and BackLedge windows.
 		if (bIsJumpOver && Position < LastEnd)
 		{
+			// Ease out of the previous warp window: from its last warped horizontal speed to the anim's.
+			if (WarpWindowExitBlendTime > 0.0f && LastWarpWindowEnd >= 0.0f && Position >= LastWarpWindowEnd
+				&& Position < LastWarpWindowEnd + WarpWindowExitBlendTime && DeltaSeconds > KINDA_SMALL_NUMBER)
+			{
+				FTransform ExitRM = InOutRootMotionParams.GetRootMotionTransform();
+				FVector ExitT = ExitRM.GetTranslation();
+				const double RawSpeed = FVector(ExitT.X, ExitT.Y, 0.0).Size() / DeltaSeconds;
+				if (RawSpeed > KINDA_SMALL_NUMBER)
+				{
+					const double Alpha = FMath::Clamp((Position - LastWarpWindowEnd) / WarpWindowExitBlendTime, 0.0f, 1.0f);
+					const double Desired = FMath::Lerp((double)LastWarpHorizontalSpeed, RawSpeed, Alpha);
+					ExitT.X *= Desired / RawSpeed;
+					ExitT.Y *= Desired / RawSpeed;
+					ExitRM.SetTranslation(ExitT);
+					InOutRootMotionParams.Set(ExitRM);
+				}
+			}
+
 			float HalfHeight = 0.0f;
 			if (const UCapsuleComponent* Capsule = Cast<UCapsuleComponent>(UpdatedComponent))
 			{
@@ -594,11 +1021,19 @@ void UGMCMotion::PreProcessRootMotion(
 	const bool bHurdle = (GetLastLandingWindowEnd(Montage) > 0.0f);
 	bLastTraversalIsJumpOver = bHurdle;
 
+	// Air catch (see bCatchWarpUsesAnimOffset): anim-offset FrontLedge target + additive vertical warp below.
+	const bool bCatchWarp = bCatchWarpUsesAnimOffset && IsCatchTraversalMontage(Montage) && !WarpPointBone.IsNone();
+
 	// Mode B (Custom1) zeroes the bone offset for hurdles — the custom physics bypasses grounding
 	// so the hand-plant offset would sink the capsule against the face. Mode A (Airborne) keeps the
 	// bone offset for hurdles because the animation's own Z root motion (via WarpAxis) drives the
 	// arc naturally from the lower hand-plant target, and grounding handles the landing.
-	const double TargetBoneOffsetZ = (bUseTraversalCustomMode && bHurdle) ? 0.0 : RootMinusBone.Z;
+	// Exception: the FrontLedge window of a jump-over with the anim-offset target (bReachWarpUsesAnimOffset) keeps the
+	// bone offset like GASP58's motion warping: the horizontal target then leaves the capsule out from the face, so it
+	// no longer sinks into it, and without the offset the root ended ~25 cm too high (apex capped flat at top + 25).
+	const bool bHurdleFrontLedgeAnimOffset = bReachWarpUsesAnimOffset && bHurdle
+		&& WarpTargetName.ToString().TrimStartAndEnd().Equals(TEXT("FrontLedge"), ESearchCase::IgnoreCase);
+	const double TargetBoneOffsetZ = (bUseTraversalCustomMode && bHurdle && !bHurdleFrontLedgeAnimOffset) ? 0.0 : RootMinusBone.Z;
 	TargetLoc.Z += HalfHeight + TargetBoneOffsetZ + WarpPointVerticalBias;
 
 	// Corner clearance (jump-over BackLedge only, mode A).
@@ -620,11 +1055,34 @@ void UGMCMotion::PreProcessRootMotion(
 		if (!FaceNormal.IsNearlyZero())
 		{
 			FaceNormal.Normalize();
-			TargetLoc += FaceNormal * Radius;
+
+			// Air catch: the capsule ends where the animation puts its root relative to the warp bone (hanging out from
+			// the face), rotated to the facing the warp squares up to (-FaceNormal).
+			// Ground reach (mantle / vault / climb) and the FrontLedge window of a jump-over: same anim offset (see
+			// bReachWarpUsesAnimOffset). With the radius inset the 5.8 Relaxed hurdle took off ~40 cm later than GASP58 and
+			// peaked past the wall (2026-10-01).
+			const bool bFrontLedgeWindow = WarpTargetName.ToString().TrimStartAndEnd().Equals(TEXT("FrontLedge"), ESearchCase::IgnoreCase);
+			const bool bCatchAnimOffset = bCatchWarp
+				|| (bReachWarpUsesAnimOffset && !WarpPointBone.IsNone() && (!bHurdle || bFrontLedgeWindow));
+			double OutFromFace = Radius;
+			if (bCatchAnimOffset)
+			{
+				const FQuat FacingQuat = FRotationMatrix::MakeFromX(-FaceNormal).ToQuat();
+				const FQuat MeshQuat = SkeletalMesh->GetRelativeRotation().Quaternion();
+				const FVector OffsetWorld = (FacingQuat * MeshQuat).RotateVector(RootMinusBone);
+				OutFromFace = FMath::Max((double)Radius, FVector::DotProduct(OffsetWorld, FaceNormal));
+				if (bDebugTraversalWarp)
+				{
+					UE_LOG(LogGMCMotion, Warning, TEXT("[TOffset] %s pos=%.3f end=%.3f rootMinusBone=%s meshYaw=%.1f offsetWorld=%s normal=%s radius=%.1f out=%.1f"),
+						*GetNameSafe(Montage), Position, WindowEnd, *RootMinusBone.ToCompactString(), SkeletalMesh->GetRelativeRotation().Yaw,
+						*OffsetWorld.ToCompactString(), *FaceNormal.ToCompactString(), Radius, OutFromFace);
+				}
+			}
+			TargetLoc += FaceNormal * OutFromFace;
 
 			// Reach only: push the target INWARD past the ledge edge so the pawn ends up on
 			// top of the obstacle, not balanced on the edge with feet half off.
-			if (!bHurdle)
+			if (!bHurdle && !bCatchAnimOffset)
 			{
 				TargetLoc -= FaceNormal * ReachLedgePush;
 			}
@@ -724,11 +1182,12 @@ void UGMCMotion::PreProcessRootMotion(
 	double Fraction = bTimeFloorWarp ? FMath::Max(AnimFraction, TimeFraction) : AnimFraction;
 	Fraction = FMath::Clamp(Fraction, 0.0, 1.0);
 
-	auto WarpAxis = [&](double ToTargetAxis, double RemainingAnimAxis, double FrameAnimAxis) -> double
+	auto WarpAxis = [&](double ToTargetAxis, double RemainingAnimAxis, double FrameAnimAxis, double MinScale) -> double
 		{
 			if (FMath::Abs(RemainingAnimAxis) > 1.0)
 			{
-				return FrameAnimAxis * FMath::Clamp(ToTargetAxis / RemainingAnimAxis, 0.0, (double)MaxWarpScale);
+				const double MaxScale = FMath::Max((double)MaxWarpScale, MinScale);
+				return FrameAnimAxis * FMath::Clamp(ToTargetAxis / RemainingAnimAxis, MinScale, MaxScale);
 			}
 			return ToTargetAxis * Fraction;
 		};
@@ -738,9 +1197,9 @@ void UGMCMotion::PreProcessRootMotion(
 	FVector Warped;
 	if (bFollowAnimPath)
 	{
-		Warped.X = WarpAxis(ToTarget.X, RemainingWorld.X, FrameDelta.X);
-		Warped.Y = WarpAxis(ToTarget.Y, RemainingWorld.Y, FrameDelta.Y);
-		Warped.Z = WarpAxis(ToTarget.Z, RemainingWorld.Z, FrameDelta.Z);
+		Warped.X = WarpAxis(ToTarget.X, RemainingWorld.X, FrameDelta.X, 0.0);
+		Warped.Y = WarpAxis(ToTarget.Y, RemainingWorld.Y, FrameDelta.Y, 0.0);
+		Warped.Z = WarpAxis(ToTarget.Z, RemainingWorld.Z, FrameDelta.Z, 0.0);
 
 		// Z-snap for reach FrontLedge (climb / mantle): distribute the vertical gap
 		// evenly over the remaining window time instead of using the animation-ratio warp.
@@ -757,6 +1216,45 @@ void UGMCMotion::PreProcessRootMotion(
 	else
 	{
 		Warped = ToTarget * Fraction;
+	}
+
+	// Air catch: the montage starts inside its FrontLedge window with only a few frames left. The anim-ratio Z above
+	// does nothing while the anim descends toward a higher target, then closes the whole gap on the last frame (+27 cm
+	// pop measured) - or misses it when a frame lands past the window end (the capsule then wedged against the wall).
+	// The gap is spread evenly over the time left instead: a steady rise of a few cm per frame, like GASP58's skew warp
+	// turns the anim's grab dip into a climb toward the target (following the dip first meant -33 cm then +50 cm).
+	if (bCatchWarp)
+	{
+		const double ZTimeFraction = (RemainingTime > KINDA_SMALL_NUMBER)
+			? FMath::Clamp((double)MontageDelta / RemainingTime, 0.0, 1.0)
+			: 1.0;
+		Warped.Z = ToTarget.Z * ZTimeFraction;
+	}
+
+	// Jump-over landing window: the forward progress (along the travel direction) is at least HurdleLandingMinWarpScale
+	// of the anim's own frame motion, and never backwards once the capsule is past BackFloor (the target-seeking branch
+	// of WarpAxis would pull it back at window end). Lateral corrections toward the target are kept.
+	if (bHurdle && HurdleLandingMinWarpScale > 0.0f
+		&& WarpTargetName.ToString().TrimStartAndEnd().Equals(TEXT("BackFloor"), ESearchCase::IgnoreCase))
+	{
+		FVector TravelDir(FrameDelta.X, FrameDelta.Y, 0.0);
+		if (TravelDir.SizeSquared() < 1e-4)
+		{
+			TravelDir = FVector(Velocity.X, Velocity.Y, 0.0);
+		}
+		TravelDir = TravelDir.GetSafeNormal();
+		if (!TravelDir.IsNearlyZero())
+		{
+			FVector WarpedXY(Warped.X, Warped.Y, 0.0);
+			const double Along = WarpedXY | TravelDir;
+			const double MinAlong = FMath::Max(0.0, (FVector(FrameDelta.X, FrameDelta.Y, 0.0) | TravelDir) * (double)HurdleLandingMinWarpScale);
+			if (Along < MinAlong)
+			{
+				WarpedXY += TravelDir * (MinAlong - Along);
+				Warped.X = WarpedXY.X;
+				Warped.Y = WarpedXY.Y;
+			}
+		}
 	}
 
 	// Reach montages: no-overshoot clamp.
@@ -822,6 +1320,11 @@ void UGMCMotion::PreProcessRootMotion(
 	}
 	Warped.Z = 0.0;
 	RootMotionTransform.SetTranslation(Warped);
+	if (bHurdle && DeltaSeconds > KINDA_SMALL_NUMBER)
+	{
+		LastWarpHorizontalSpeed = FVector(Warped.X, Warped.Y, 0.0).Size() / DeltaSeconds;
+		LastWarpWindowEnd = WindowEnd;
+	}
 
 	// --- Traversal Hand IK targets ---
 	// Only during FrontLedge window (bone provider active = reach/climb/mantle).
@@ -891,6 +1394,120 @@ bool UGMCMotion::IsTraversalMontageRightFoot(UAnimMontage* Montage) const
 	return Montage && Montage->GetName().EndsWith(TEXT("Rfoot"));
 }
 
+bool UGMCMotion::IsCatchTraversalMontage(const UAnimMontage* Montage)
+{
+	return Montage && Montage->GetName().Contains(TEXT("Catch"));
+}
+
+float UGMCMotion::AdjustTraversalStartTimeForDistance(const UObject* Context, UObject* MontageObject, float StartTime,
+	FVector FrontLedgeLocation, FVector FrontLedgeNormal)
+{
+	const UActorComponent* ContextComponent = Cast<UActorComponent>(Context);
+	const AActor* Owner = ContextComponent ? ContextComponent->GetOwner() : Cast<AActor>(Context);
+	const UGMCMotion* Motion = Owner ? Owner->FindComponentByClass<UGMCMotion>() : nullptr;
+	UAnimMontage* Montage = Cast<UAnimMontage>(MontageObject);
+	if (!Motion || !Motion->bAdjustTraversalStartTimeByDistance || !Montage || !Motion->UpdatedComponent || !Motion->SkeletalMesh
+		|| IsCatchTraversalMontage(Montage))
+	{
+		return StartTime;
+	}
+
+	// Searchable range of the montage (the chooser's pose search never starts outside it).
+	float RangeStart = -1.0f, RangeEnd = -1.0f, BranchStart = -1.0f, BranchEnd = -1.0f;
+	// First FrontLedge window end and its warp bone.
+	float WindowEnd = FLT_MAX;
+	FName WarpBone;
+	for (const FAnimNotifyEvent& Event : Montage->Notifies)
+	{
+		if (!Event.NotifyStateClass)
+		{
+			continue;
+		}
+		const FString ClassName = Event.NotifyStateClass->GetClass()->GetName();
+		if (ClassName.Contains(TEXT("PoseSearchSamplingRange")))
+		{
+			RangeStart = Event.GetTriggerTime();
+			RangeEnd = Event.GetEndTriggerTime();
+		}
+		else if (ClassName.Contains(TEXT("PoseSearchBranchIn")))
+		{
+			BranchStart = Event.GetTriggerTime();
+			BranchEnd = Event.GetEndTriggerTime();
+		}
+		else if (const UAnimNotifyState_MotionWarping* Warping = Cast<UAnimNotifyState_MotionWarping>(Event.NotifyStateClass))
+		{
+			const URootMotionModifier_Warp* Modifier = Cast<URootMotionModifier_Warp>(Warping->RootMotionModifier);
+			if (Modifier && Modifier->WarpTargetName.ToString().TrimStartAndEnd().Equals(TEXT("FrontLedge"), ESearchCase::IgnoreCase)
+				&& Event.GetEndTriggerTime() < WindowEnd)
+			{
+				WindowEnd = Event.GetEndTriggerTime();
+				WarpBone = Modifier->WarpPointAnimProvider == EWarpPointAnimProvider::Bone ? Modifier->WarpPointAnimBoneName : NAME_None;
+			}
+		}
+	}
+	if (RangeStart < 0.0f)
+	{
+		RangeStart = BranchStart;
+		RangeEnd = BranchEnd;
+	}
+	if (RangeStart < 0.0f || WindowEnd == FLT_MAX)
+	{
+		return StartTime;
+	}
+	RangeStart = FMath::Max(RangeStart, 0.0f);
+	RangeEnd = FMath::Min(RangeEnd, WindowEnd);
+	if (RangeEnd - RangeStart < 1.0f / 60.0f)
+	{
+		return StartTime;
+	}
+
+	// Distance the capsule has to cover: to the face, minus where the anim puts the root at the window end (same target
+	// as the FrontLedge warp, see bReachWarpUsesAnimOffset).
+	FVector Into(-FrontLedgeNormal.X, -FrontLedgeNormal.Y, 0.0);
+	if (!Into.Normalize())
+	{
+		return StartTime;
+	}
+	float Radius = 0.0f;
+	if (const UCapsuleComponent* Capsule = Cast<UCapsuleComponent>(Motion->UpdatedComponent))
+	{
+		Radius = Capsule->GetScaledCapsuleRadius();
+	}
+	const FQuat MeshQuat = Motion->SkeletalMesh->GetRelativeRotation().Quaternion();
+	double OutFromFace = Radius;
+	if (!WarpBone.IsNone() && Motion->bReachWarpUsesAnimOffset)
+	{
+		OutFromFace = FMath::Max((double)Radius, -MeshQuat.RotateVector(Motion->ComputeRootMinusBoneOffset(Montage, WindowEnd, WarpBone)).X);
+	}
+	const double ToFace = FVector::DotProduct(FrontLedgeLocation - Motion->UpdatedComponent->GetComponentLocation(), Into);
+	const double Needed = ToFace - OutFromFace;
+	if (Needed <= 1.0)
+	{
+		return StartTime;
+	}
+	const double Desired = Needed / FMath::Max((double)Motion->TraversalStartTimeWarpScale, 0.1);
+
+	// Anim run-up from t to the window end decreases with t: keep the sample closest to the desired run-up.
+	double BestTime = StartTime, BestError = DBL_MAX;
+	for (float Time = RangeStart; Time <= RangeEnd + KINDA_SMALL_NUMBER; Time += 1.0f / 120.0f)
+	{
+		const FTransform RunUp = Montage->ExtractRootMotionFromTrackRange(Time, WindowEnd, FAnimExtractContext());
+		const double Error = FMath::Abs(RunUp.GetTranslation().Size2D() - Desired);
+		if (Error < BestError)
+		{
+			BestError = Error;
+			BestTime = Time;
+		}
+	}
+
+	if (Motion->bDebugTraversalWarp)
+	{
+		UE_LOG(LogGMCMotion, Warning, TEXT("[TStartAdjust] %s chooser=%.3f -> %.3f | range=[%.3f,%.3f] winEnd=%.3f toFace=%.1f out=%.1f desired=%.1f err=%.1f"),
+			*GetNameSafe(Montage), StartTime, BestTime, RangeStart, RangeEnd, WindowEnd, ToFace, OutFromFace, Desired, BestError);
+	}
+	return static_cast<float>(BestTime);
+}
+
 UAnimMontage* UGMCMotion::GetTraversalMontageForFoot(UAnimMontage* Montage, bool bRightFoot) const
 {
 	if (!Montage)
@@ -927,10 +1544,37 @@ void UGMCMotion::StopTraversalMovement()
 {
 	if (bDebugTraversalWarp)
 	{
-		UE_LOG(LogGMCMotion, Warning, TEXT("[TExit] STOP (vel->0) | jumpOver=%d capturedExitVel=(%.0f,%.0f) speed2D=%.0f"),
+		UE_LOG(LogGMCMotion, Warning, TEXT("[TExit] STOP (%s) | jumpOver=%d capturedExitVel=(%.0f,%.0f) speed2D=%.0f"),
+			bZeroVelocityAtTraversalStart ? TEXT("vel->0") : TEXT("velocity kept"),
 			bLastTraversalIsJumpOver ? 1 : 0, TraversalExitVelocity.X, TraversalExitVelocity.Y, TraversalExitVelocity.Size2D());
 	}
-	UpdateVelocity(FVector::ZeroVector);
+	TraversalEntrySpeed = Velocity.Size2D();
+	if (bZeroVelocityAtTraversalStart)
+	{
+		UpdateVelocity(FVector::ZeroVector);
+	}
+	else if (Velocity.Z > 0.0)
+	{
+		// Ground start: Space also fires the jump, whose impulse was integrated once (+9.7 cm in the first move), and the
+		// traversal mode has no gravity to bring it back -> feet ~10 cm off the floor for the whole run-up (visible since
+		// the 5.8 montages start earlier, 2026-10-01). Keep the run speed, drop the jump.
+		UpdateVelocity(FVector(Velocity.X, Velocity.Y, 0.0));
+	}
+}
+
+float UGMCMotion::GetConfirmedTraversalStartTime() const
+{
+	if (!bConfirmedStartTimePropSearched)
+	{
+		bConfirmedStartTimePropSearched = true;
+		const FNumericProperty* Prop = CastField<FNumericProperty>(GetClass()->FindPropertyByName(TEXT("ConfirmedTraversalStartTime")));
+		ConfirmedStartTimeProp = Prop && Prop->IsFloatingPoint() ? Prop : nullptr;
+	}
+	if (const FNumericProperty* Prop = CastField<FNumericProperty>(ConfirmedStartTimeProp))
+	{
+		return static_cast<float>(Prop->GetFloatingPointPropertyValue(Prop->ContainerPtrToValuePtr<void>(this)));
+	}
+	return -1.0f;
 }
 
 void UGMCMotion::RestoreTraversalExitVelocity()
@@ -940,7 +1584,34 @@ void UGMCMotion::RestoreTraversalExitVelocity()
 		UE_LOG(LogGMCMotion, Warning, TEXT("[TExit] RESTORE (inherit anim vel) | jumpOver=%d injectVel=(%.0f,%.0f) speed2D=%.0f"),
 			bLastTraversalIsJumpOver ? 1 : 0, TraversalExitVelocity.X, TraversalExitVelocity.Y, TraversalExitVelocity.Size2D());
 	}
-	UpdateVelocity(FVector(TraversalExitVelocity.X, TraversalExitVelocity.Y, 0.0));
+	FVector ExitVelocity(TraversalExitVelocity.X, TraversalExitVelocity.Y, 0.0);
+
+	// Exit in the air (vault over a drop: the anim's tail already descends at ~-400 cm/s): keep that fall speed. Restoring
+	// Z = 0 restarted the fall from rest, a visible hang in mid-air (user report 2026-10-01). Never upward.
+	// BP_GMCMovement sets the Grounded mode just before this call, so the mode says nothing: query the floor.
+	bool bExitInAir = false;
+	if (bKeepTraversalExitFallSpeed && TraversalExitVelocity.Z < 0.0)
+	{
+		UpdateFloor(CurrentFloor, FVector::DownVector, FloorTraceLength, FloorUpdateTolerance, FloorTraceShapeScale, false, true);
+		if (!CurrentFloor.HasValidShapeData() || CurrentFloor.GetShapeDistanceToFloor() > MAX_DISTANCE_TO_FLOOR + 5.f)
+		{
+			bExitInAir = true;
+			ExitVelocity.Z = TraversalExitVelocity.Z;
+			SetMovementMode(EGMC_MovementMode::Airborne);
+		}
+	}
+
+	// The cap is a ground thing: in the air the anim's horizontal speed is kept, like GASP58 (Catch_Vault exit 473 cm/s).
+	const FVector Input = GetProcessedInputVector();
+	const bool bInputAlong = !Input.IsNearlyZero()
+		&& (ExitVelocity.GetSafeNormal2D() | FVector(Input.X, Input.Y, 0.).GetSafeNormal()) > 0.7;
+	const bool bCarry = !bCapTraversalExitSpeed || bExitInAir || (bLastTraversalIsJumpOver && bInputAlong);
+	if (!bCarry)
+	{
+		ExitVelocity = ExitVelocity.GetClampedToMaxSize2D(GetMaxSpeed());
+	}
+	UpdateVelocity(ExitVelocity);
+	bTraversalExitCarry = bCarry && TraversalExitOverSpeedDeceleration > 0.0f;
 }
 
 void UGMCMotion::DebugLogTraversalChoice(
@@ -1089,7 +1760,17 @@ void UGMCMotion::UpdateTraversalCollisionIgnore()
 		return;
 	}
 
-	const bool bWantIgnore = bDisableObstacleCollision && bTraversalWarpActive && bLastTraversalIsJumpOver;
+	// Kind of traversal read from the active montage itself (the bLastTraversal* flags are only refreshed once a warp
+	// window opens, so before that they still describe the previous traversal).
+	bool bCrossesOver = false;
+	if (bDisableObstacleCollision && bTraversalWarpActive)
+	{
+		if (UAnimMontage* Montage = GetActiveRootMotionMontage(MontageTracker))
+		{
+			bCrossesOver = GetLastLandingWindowEnd(Montage) > 0.0f || Montage->GetName().Contains(TEXT("Vault"));
+		}
+	}
+	const bool bWantIgnore = bCrossesOver;
 
 	if (bWantIgnore && !IgnoredObstacle.IsValid())
 	{
@@ -1635,6 +2316,12 @@ void UGMCMotion::TickComponent(float DeltaTime, ELevelTick TickType, FActorCompo
 
 void UGMCMotion::ApplyRotation(bool bIsDirectBotMove, const FGMC_RootMotionVelocitySettings& RootMotionMetaData, float DeltaSeconds)
 {
+	// The ragdoll sets the yaw itself (PhysicsRagdoll).
+	if (GetMovementMode() == RagdollMovementMode)
+	{
+		return;
+	}
+
 	if (bIsDirectBotMove)
 	{
 		Super::ApplyRotation(bIsDirectBotMove, RootMotionMetaData, DeltaSeconds);
@@ -1646,6 +2333,7 @@ void UGMCMotion::ApplyRotation(bool bIsDirectBotMove, const FGMC_RootMotionVeloc
 	{
 		return;
 	}
+
 
 	// Skip rotation during root motion when the montage opts out of rotation application.
 	if (HasRootMotion() && !RootMotionMetaData.bApplyRotationWithRootMotion)
@@ -1852,6 +2540,79 @@ void UGMCMotion::BindReplicationData_Implementation()
 		EGMC_PredictionMode::ServerAuth_Output_ClientValidated,
 		EGMC_CombineMode::AlwaysCombine,
 		EGMC_SimulationMode::PeriodicAndOnChange_Output,
+		EGMC_InterpolationFunction::NearestNeighbour
+	);
+
+	// Ragdoll mode: decided by the server (UGMCGASPRagdollComponent), same contract as Downed.
+	BI_RagdollMode = BindBool(
+		bRagdollMode,
+		EGMC_PredictionMode::ServerAuth_Output_ClientValidated,
+		EGMC_CombineMode::AlwaysCombine,
+		EGMC_SimulationMode::PeriodicAndOnChange_Output,
+		EGMC_InterpolationFunction::NearestNeighbour
+	);
+
+	// Post-jump-over speed carry: movement-only state, carried from move to move.
+	// Ground velocity smoothing state (bSmoothGroundVelocity): carried from move to move like the velocity.
+	BI_SmoothIntermediateVelocity = BindCompressedVector2D(
+		SmoothIntermediateVelocity,
+		EGMC_PredictionMode::ServerAuth_Output_ClientValidated,
+		EGMC_CombineMode::AlwaysCombine,
+		EGMC_SimulationMode::None,
+		EGMC_InterpolationFunction::NearestNeighbour
+	);
+	BI_SmoothSpringVelocity = BindCompressedVector2D(
+		SmoothSpringVelocity,
+		EGMC_PredictionMode::ServerAuth_Output_ClientValidated,
+		EGMC_CombineMode::AlwaysCombine,
+		EGMC_SimulationMode::None,
+		EGMC_InterpolationFunction::NearestNeighbour
+	);
+	BI_SmoothSpringAcceleration = BindCompressedVector2D(
+		SmoothSpringAcceleration,
+		EGMC_PredictionMode::ServerAuth_Output_ClientValidated,
+		EGMC_CombineMode::AlwaysCombine,
+		EGMC_SimulationMode::None,
+		EGMC_InterpolationFunction::NearestNeighbour
+	);
+	BI_SmoothStateValid = BindBool(
+		bSmoothStateValid,
+		EGMC_PredictionMode::ServerAuth_Output_ClientValidated,
+		EGMC_CombineMode::AlwaysCombine,
+		EGMC_SimulationMode::None,
+		EGMC_InterpolationFunction::NearestNeighbour
+	);
+
+	BI_TraversalExitCarry = BindBool(
+		bTraversalExitCarry,
+		EGMC_PredictionMode::ServerAuth_Output_ClientValidated,
+		EGMC_CombineMode::AlwaysCombine,
+		EGMC_SimulationMode::None,
+		EGMC_InterpolationFunction::NearestNeighbour
+	);
+
+	// Traversal entry speed: movement-only state (captured at traversal start, read during the pre-window phase).
+	BI_TraversalEntrySpeed = BindSinglePrecisionFloat(
+		TraversalEntrySpeed,
+		EGMC_PredictionMode::ServerAuth_Output_ClientValidated,
+		EGMC_CombineMode::AlwaysCombine,
+		EGMC_SimulationMode::None,
+		EGMC_InterpolationFunction::NearestNeighbour
+	);
+
+	// Jump-over window exit easing state (see WarpWindowExitBlendTime).
+	BI_LastWarpHorizontalSpeed = BindSinglePrecisionFloat(
+		LastWarpHorizontalSpeed,
+		EGMC_PredictionMode::ServerAuth_Output_ClientValidated,
+		EGMC_CombineMode::AlwaysCombine,
+		EGMC_SimulationMode::None,
+		EGMC_InterpolationFunction::NearestNeighbour
+	);
+	BI_LastWarpWindowEnd = BindSinglePrecisionFloat(
+		LastWarpWindowEnd,
+		EGMC_PredictionMode::ServerAuth_Output_ClientValidated,
+		EGMC_CombineMode::AlwaysCombine,
+		EGMC_SimulationMode::None,
 		EGMC_InterpolationFunction::NearestNeighbour
 	);
 }
@@ -2371,25 +3132,47 @@ bool UGMCMotion::CanSprintInCurrentDirection() const
 	return bSprintConeLatched;
 }
 
+namespace
+{
+	// Rotation the body should face in Aiming (strafe) mode.
+	// Normally the raw control rotation (zero lag). While the player free-looks, BP_GMCMovement
+	// freezes its AimingRotation on FreeLookAimRotation (WantsToFreeLook / FreeLookAimRotation are
+	// GMC-bound inputs, so client, server and replays agree) and the body must stay on that
+	// rotation while the camera/head roam. Read through reflection like the sim-proxy pull-ins.
+	// Sim proxies have no controller: they use the replicated AimingRotation, already frozen.
+	// (Free function on purpose: no header change, so Live Coding can rebuild this .cpp alone.)
+	FRotator GetAimingRotationForFacing(const UGMCMotion& Movement, const FRotator& CachedAimingRotation)
+	{
+		const UClass* MovementClass = Movement.GetClass();
+		if (const FBoolProperty* WantsFreeLook = CastField<FBoolProperty>(MovementClass->FindPropertyByName(TEXT("WantsToFreeLook"))))
+		{
+			if (WantsFreeLook->GetPropertyValue_InContainer(&Movement))
+			{
+				if (const FStructProperty* FreeLookRot = CastField<FStructProperty>(MovementClass->FindPropertyByName(TEXT("FreeLookAimRotation"))))
+				{
+					if (FreeLookRot->Struct == TBaseStructure<FRotator>::Get())
+					{
+						return *FreeLookRot->ContainerPtrToValuePtr<FRotator>(&Movement);
+					}
+				}
+			}
+		}
+		if (const APawn* Pawn = Cast<APawn>(Movement.GetOwner()))
+		{
+			if (const AController* PC = Pawn->GetController())
+			{
+				return PC->GetControlRotation();
+			}
+		}
+		return CachedAimingRotation;
+	}
+}
+
 FVector UGMCMotion::GetOrientationIntent() const
 {
 	if (RotationMode == EGMCMotion_RotationMode::Aiming)
 	{
-		if (const APawn* Pawn = Cast<APawn>(GetOwner()))
-		{
-			if (const AController* PC = Pawn->GetController())
-			{
-				FVector Forward = PC->GetControlRotation().Vector();
-				Forward.Z = 0.0f;
-				if (!Forward.IsNearlyZero())
-				{
-					Forward.Normalize();
-					return Forward;
-				}
-			}
-		}
-		// Sim proxies have no controller — use the replicated aiming rotation.
-		FVector Forward = CachedAimingRotation.Vector();
+		FVector Forward = GetAimingRotationForFacing(*this, CachedAimingRotation).Vector();
 		Forward.Z = 0.0f;
 		if (!Forward.IsNearlyZero())
 		{
@@ -2415,15 +3198,7 @@ FRotator UGMCMotion::GetTargetOrientation() const
 {
 	if (RotationMode == EGMCMotion_RotationMode::Aiming)
 	{
-		if (const APawn* Pawn = Cast<APawn>(GetOwner()))
-		{
-			if (const AController* PC = Pawn->GetController())
-			{
-				return PC->GetControlRotation();
-			}
-		}
-		// Sim proxies have no controller — use the replicated aiming rotation.
-		return CachedAimingRotation;
+		return GetAimingRotationForFacing(*this, CachedAimingRotation);
 	}
 
 	const FVector Vel = GetLinearVelocity_GMC();
@@ -2433,6 +3208,219 @@ FRotator UGMCMotion::GetTargetOrientation() const
 	}
 
 	return OverridenDesiredFacing;
+}
+
+// =====================================================================================
+//  Stance collision
+// =====================================================================================
+
+bool UGMCMotion::HasRoomForVerticalCapsule(float TargetHalfHeight) const
+{
+	if (!UpdatedComponent)
+	{
+		return false;
+	}
+
+	const float Radius = GetRootCollisionExtent(false).X;
+	const float ScaleZ = FMath::Abs(static_cast<float>(UpdatedComponent->GetComponentScale().Z));
+	// Keep the bottom of the collision where it is (GetRootCollisionHalfHeight is the Z extent for every shape).
+	const FVector TestLocation = UpdatedComponent->GetComponentLocation()
+		+ FVector(0., 0., (TargetHalfHeight - GetRootCollisionHalfHeight(false)) * ScaleZ);
+	// 0.95: the test shape must not touch the floor the pawn stands on.
+	return IsValidPosition(EGMC_CollisionShape::VerticalCapsule, FVector(Radius, Radius, TargetHalfHeight),
+		TestLocation, UpdatedComponent->GetComponentQuat(), ECC_Pawn, 0.95f);
+}
+
+bool UGMCMotion::ResetStanceCollision(float StandHalfHeight)
+{
+	// The slope slide isn't Grounded, so the BP calls this when it starts: keep the slide's crouch-height capsule
+	// (driven by UpdateStanceCollision) instead of popping to the standing height against the slope.
+	if (!UpdatedComponent || IsSlopeSliding())
+	{
+		return false;
+	}
+
+	const float Radius = GetRootCollisionExtent(false).X;
+	if (GetRootCollisionShape() != EGMC_CollisionShape::VerticalCapsule)
+	{
+		SetRootCollisionShape(EGMC_CollisionShape::VerticalCapsule, FVector(Radius, Radius, StandHalfHeight), false, NAME_None);
+		return true;
+	}
+	if (!FMath::IsNearlyEqual(GetRootCollisionHalfHeight(false), StandHalfHeight, 0.01f))
+	{
+		SetRootCollisionHalfHeight(StandHalfHeight, false);
+		return true;
+	}
+	return false;
+}
+
+uint8 UGMCMotion::UpdateStanceCollision(uint8 DesiredStance, float StandHalfHeight, float CrouchHalfHeight, float InterpSpeed,
+	float DeltaTime, bool bAdjustPosition, bool& bCollisionChanged)
+{
+	bCollisionChanged = false;
+	ON_SCOPE_EXIT { bStanceCollisionChanging = bCollisionChanged; };
+	if (!UpdatedComponent)
+	{
+		return 0;
+	}
+
+	constexpr uint8 StanceStand = 0;
+	constexpr uint8 StanceCrouch = 1;
+	// Shrinking never collides, so the lerps use a lenient test (same value the crouch BP used).
+	constexpr float ShrinkTolerance = 0.05f;
+	constexpr float SizeTolerance = 0.5f;
+
+	const auto Track = [&bCollisionChanged](float Delta)
+	{
+		if (Delta > 0.f)
+		{
+			bCollisionChanged = true;
+		}
+	};
+
+	// --- Slope slide: crouch-height capsule --------------------------------------------------
+	// The BP asks for Stand while not Grounded. The position is always adjusted (the BP only adjusts when Grounded) so the
+	// capsule bottom stays on the slope. Stand is returned (the ABP plays its Slide state); leaving the slide, the
+	// stand / crouch lerp below grows back only if there is room.
+	const float CurrentHalfHeight = GetRootCollisionHalfHeight(false);
+	if (IsSlopeSliding())
+	{
+		if (!FMath::IsNearlyEqual(CurrentHalfHeight, CrouchHalfHeight, 0.01f))
+		{
+			const bool bGrow = CrouchHalfHeight > CurrentHalfHeight;
+			Track(LerpRootCollisionHalfHeight(CrouchHalfHeight, InterpSpeed, ShrinkTolerance, DeltaTime, true,
+				bGrow ? EGMC_AdjustDirection::Up : EGMC_AdjustDirection::Down));
+		}
+		return StanceStand;
+	}
+
+	// --- Stand <-> crouch ---------------------------------------------------------------------
+	uint8 Result = DesiredStance == StanceStand ? StanceStand : StanceCrouch;
+	float TargetHalfHeight = Result == StanceStand ? StandHalfHeight : CrouchHalfHeight;
+	if (Result == StanceStand && CurrentHalfHeight < StandHalfHeight - SizeTolerance && !HasRoomForVerticalCapsule(StandHalfHeight))
+	{
+		Result = StanceCrouch;
+		TargetHalfHeight = CrouchHalfHeight;
+	}
+
+	if (!FMath::IsNearlyEqual(CurrentHalfHeight, TargetHalfHeight, 0.01f))
+	{
+		const bool bGrow = TargetHalfHeight > CurrentHalfHeight;
+		Track(LerpRootCollisionHalfHeight(TargetHalfHeight, InterpSpeed, ShrinkTolerance, DeltaTime, bAdjustPosition,
+			bGrow ? EGMC_AdjustDirection::Up : EGMC_AdjustDirection::Down));
+	}
+	return Result;
+}
+
+float UGMCMotion::GetOverMaxSpeedDeceleration() const
+{
+	if (bTraversalExitCarry && !IsMovingOnGround())
+	{
+		// Traversal exit in the air (vault over a drop): the anim's speed is kept until landing, like GASP58's falling mode.
+		return 0.f;
+	}
+	if (bTraversalExitCarry && IsMovingOnGround())
+	{
+		// LimitSpeed runs after ApplyInputVelocity added the input acceleration this move: include it, so the NET
+		// slow-down is TraversalExitOverSpeedDeceleration (returning the bare value let a held input keep accelerating
+		// the pawn above its max speed: walking chained traversals ended up at run speed).
+		return TraversalExitOverSpeedDeceleration + GetInputAcceleration() * FMath::Min(GetGroundFriction(), 1.f);
+	}
+	if (bGroundOverMaxSpeedUsesBraking && IsMovingOnGround() && GetMovementMode() == EGMC_MovementMode::Grounded)
+	{
+		// GASP58 parity (see bGroundOverMaxSpeedUsesBraking). With an input, LimitSpeed runs after ApplyInputVelocity added
+		// the input acceleration: include it so the NET slow-down is the braking deceleration. Without one,
+		// ApplyDeceleration already brakes: nothing more here.
+		return GetProcessedInputVector().IsNearlyZero()
+			? 0.f
+			: GetBrakingDeceleration() + GetInputAcceleration() * FMath::Min(GetGroundFriction(), 1.f);
+	}
+	return Super::GetOverMaxSpeedDeceleration();
+}
+
+bool UGMCMotion::ShouldSmoothGroundVelocity() const
+{
+	return bSmoothGroundVelocity && IsMovingOnGround() && GetMovementMode() == EGMC_MovementMode::Grounded && !HasRootMotion()
+		&& !bTraversalWarpActive
+		&& !(IsServerBot() && !UseAccelerationForPathFollowing());
+}
+
+void UGMCMotion::CalculateVelocity(float DeltaSeconds)
+{
+	// Ground velocity smoothing (see bSmoothGroundVelocity): mirror of Mover's USmoothWalkingMode::GenerateWalkMove.
+	const bool bSmooth = ShouldSmoothGroundVelocity() && DeltaSeconds > UE_KINDA_SMALL_NUMBER;
+	const FVector2D ActualVelocity(Velocity.X, Velocity.Y);
+	if (bSmooth)
+	{
+		if (!bSmoothStateValid)
+		{
+			SmoothIntermediateVelocity = ActualVelocity;
+			SmoothSpringVelocity = ActualVelocity;
+			SmoothSpringAcceleration = FVector2D::ZeroVector;
+		}
+		// The more the real velocity differs from what the spring gave last move (collisions), the faster the
+		// intermediate velocity is pulled back to it.
+		const double Match = FMath::Clamp((SmoothSpringVelocity | ActualVelocity)
+			/ FMath::Max(ActualVelocity.Size() * SmoothSpringVelocity.Size(), UE_SMALL_NUMBER), 0., 1.);
+		FMath::ExponentialSmoothingApprox(SmoothIntermediateVelocity, ActualVelocity, DeltaSeconds,
+			static_cast<float>((GroundOutsideInfluenceSmoothingTime + UE_KINDA_SMALL_NUMBER) / FMath::Max(1. - Match, UE_KINDA_SMALL_NUMBER)));
+		// Turn the intermediate velocity toward the input direction, keeping its length (Mover's TurningStrength).
+		const FVector TurnInput = GetProcessedInputVector();
+		const FVector2D TurnDirection = FVector2D(TurnInput.X, TurnInput.Y).GetSafeNormal();
+		if (GroundTurningStrength > 0.f && !TurnDirection.IsNearlyZero())
+		{
+			FMath::ExponentialSmoothingApprox(SmoothIntermediateVelocity, TurnDirection * SmoothIntermediateVelocity.Size(),
+				DeltaSeconds, SpringMath::StrengthToSmoothingTime(GroundTurningStrength));
+		}
+		// GMC's acceleration / braking / speed limits act on the intermediate velocity.
+		Velocity.X = SmoothIntermediateVelocity.X;
+		Velocity.Y = SmoothIntermediateVelocity.Y;
+	}
+
+	Super::CalculateVelocity(DeltaSeconds);
+
+	if (bSmooth)
+	{
+		const FVector2D Intermediate(Velocity.X, Velocity.Y);
+		const FVector Input = GetProcessedInputVector().GetClampedToMaxSize(1.0);
+		const FVector2D Desired = FVector2D(Input.X, Input.Y) * GetMaxSpeed();
+		const bool bAccelerating = 1.01 * Desired.SizeSquared() > ActualVelocity.SizeSquared();
+		FVector2D Spring = ActualVelocity;
+		SpringMath::CriticalSpringDamper(Spring, SmoothSpringAcceleration, Intermediate,
+			bAccelerating ? GroundAccelerationSmoothingTime : GroundDecelerationSmoothingTime, DeltaSeconds);
+		// Dead zones (Mover's): settle on the target instead of creeping.
+		if ((Intermediate - Spring).SizeSquared() < FMath::Square(0.01))
+		{
+			Spring = Intermediate;
+			if (SmoothSpringAcceleration.SizeSquared() < FMath::Square(0.001))
+			{
+				SmoothSpringAcceleration = FVector2D::ZeroVector;
+			}
+		}
+		SmoothIntermediateVelocity = Intermediate;
+		SmoothSpringVelocity = Spring;
+		bSmoothStateValid = true;
+		Velocity.X = Spring.X;
+		Velocity.Y = Spring.Y;
+	}
+	else
+	{
+		bSmoothStateValid = false;
+	}
+
+	// Post-jump-over carry ends once back at max speed, when the input stops or turns away, or when the next traversal
+	// takes over (its root motion owns the velocity). Not on "airborne": RestoreTraversalExitVelocity can run while the
+	// traversal mode is still set; the carry only changes the grounded over-speed deceleration anyway.
+	if (bTraversalExitCarry)
+	{
+		const FVector Input = GetProcessedInputVector();
+		const FVector Vel2D(Velocity.X, Velocity.Y, 0.);
+		const bool bInputAlong = !Input.IsNearlyZero() && (Vel2D.GetSafeNormal() | FVector(Input.X, Input.Y, 0.).GetSafeNormal()) > 0.7;
+		if (bTraversalWarpActive || !bInputAlong || Vel2D.Size() <= GetMaxSpeed() + 1.0)
+		{
+			bTraversalExitCarry = false;
+		}
+	}
 }
 
 void UGMCMotion::UpdateRotationMode_CPP()

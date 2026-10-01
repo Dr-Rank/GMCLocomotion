@@ -25,6 +25,10 @@
 			"Enabled": true
 		},
 		{
+			"Name": "AnimationWarping",
+			"Enabled": true
+		},
+		{
 			"Name": "GMC",
 			"Enabled": true
 		},
