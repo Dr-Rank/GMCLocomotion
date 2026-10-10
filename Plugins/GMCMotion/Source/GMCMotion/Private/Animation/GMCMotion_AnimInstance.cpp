@@ -1,4 +1,6 @@
-// Copyright 2026 Execute Games, all rights reserved
+// Copyright (c) 2026 Execute Games
+// SPDX-License-Identifier: MIT
+// Licensed under the MIT License. See LICENSE in the plugin root.
 
 #include "Animation/GMCMotion_AnimInstance.h"
 
