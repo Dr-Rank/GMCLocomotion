@@ -12,6 +12,26 @@
 	],
 	"Plugins": [
 		{
+			"Name": "GMC",
+			"Enabled": true
+		},
+		{
+			"Name": "GMCMotion",
+			"Enabled": true
+		},
+		{
+			"Name": "GMCAbilitySystem",
+			"Enabled": true
+		},
+		{
+			"Name": "GMCBlueprintMacroLibrary",
+			"Enabled": true
+		},
+		{
+			"Name": "OnlineSubsystemSteam",
+			"Enabled": true
+		},
+		{
 			"Name": "ModelingToolsEditorMode",
 			"Enabled": true,
 			"TargetAllowList": [
