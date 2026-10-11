@@ -11,6 +11,8 @@
 
 #if WITH_AUTOMATION_WORKER
 
+// Arithmetic fixtures explicitly disable bounds: the production default is an active [0, 0] clamp.
+
 BEGIN_DEFINE_SPEC(FGMASAttributeSetCombinatoricsSpec,
 	"GMAS.Stress.Set",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
@@ -25,7 +27,7 @@ END_DEFINE_SPEC(FGMASAttributeSetCombinatoricsSpec)
 
 FAttribute FGMASAttributeSetCombinatoricsSpec::MakeAttr(float Init) const
 {
-	FAttribute A; A.InitialValue = Init; A.Init(); return A;
+	FAttribute A; A.Clamp.bClampMin = false; A.Clamp.bClampMax = false; A.InitialValue = Init; A.Init(); return A;
 }
 FGMCAttributeModifier FGMASAttributeSetCombinatoricsSpec::MakeSetMod(UGMCAbilityEffect* Eff, float V, int Idx, double T, EModifierType Op) const
 {

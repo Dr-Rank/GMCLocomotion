@@ -14,6 +14,11 @@ void UGMCAbilityTaskBase::Activate()
 	// just before its first heartbeat round-trip completes is not cancelled prematurely.
 	LastHeartbeatReceivedTime = FPlatformTime::Seconds() + HeartbeatMaxInterval;
 
+	// Seed the send-stamp too, so the first client heartbeat waits one full interval. A heartbeat
+	// sent on the activation tick can beat the server twin into existence, which reads as a
+	// phantom AbilityID divergence. The server already holds one grace interval, so waiting is safe.
+	ClientLastHeartbeatSentTime = FPlatformTime::Seconds();
+
 	// [TaskDiag] probe: a task registered DURING a client replay is created on the client
 	// ONLY (the server never replays), so the per-ability TaskIDCounter diverges from here
 	// on — every later task on this ability gets mismatched IDs, Progress payloads dispatch
@@ -102,10 +107,13 @@ void UGMCAbilityTaskBase::AncillaryTick(float DeltaTime){
 		// when the client stops heartbeating, every task starves at once, so what matters is
 		// the whole-ability picture (which tasks had completed, which never progressed,
 		// heartbeat counts per task) plus whether the timed-out task was even still pending.
-		UE_LOG(LogTemp, Error, TEXT("[TaskHeartbeat] Timeout: cancelling ability '%s' (tag '%s') - task %s (TaskID %d, Completed=%d), %.2fs since last heartbeat (max %.2f), %d heartbeats received. %s"),
+		// last_taskdata_ability_id is the id the OTHER side was addressing. When it differs from
+		// this ability's own id, the starvation is an id divergence and the line proves it alone.
+		UE_LOG(LogTemp, Error, TEXT("[TaskHeartbeat] Timeout: cancelling ability '%s' (tag '%s') - task %s (TaskID %d, Completed=%d), %.2fs since last heartbeat (max %.2f), %d heartbeats received, last_taskdata_ability_id=%d. %s"),
 		  *Ability->GetName(), *Ability->AbilityTag.ToString(), *GetClass()->GetName(), TaskID,
 		  bTaskCompleted ? 1 : 0,
 		  TimeSinceLastHeartbeat, HeartbeatMaxInterval, HeartbeatReceivedCount,
+		  AbilitySystemComponent->GetLastReceivedTaskDataAbilityID(),
 		  *Ability->GetAbilityCutDiagnostics());
 		AbilitySystemComponent->OnTaskTimeout.Broadcast(Ability->AbilityTag);
 		Ability->EndAbility();

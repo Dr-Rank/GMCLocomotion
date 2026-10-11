@@ -24,6 +24,19 @@ END_DEFINE_SPEC(FGMASAttributeSpec)
 FAttribute FGMASAttributeSpec::MakeAttr(float InitVal) const
 {
 	FAttribute Attr;
+
+	// ⚠ FAttributeClamp defaults to bClampMin/bClampMax = TRUE with Min/Max = 0, so a
+	// default-constructed attribute carries an ACTIVE [0, 0] clamp -- and Init() runs
+	// RawValue = Clamp.ClampValue(InitialValue) unconditionally. Without these two lines every
+	// attribute built here initialises to 0 regardless of InitVal, and every assertion downstream
+	// compares against 0.
+	//
+	// "No clamp" therefore has to be stated. It is not the struct default, however much the name
+	// suggests otherwise. Tests that DO want a bound re-enable the one they care about after
+	// calling this.
+	Attr.Clamp.bClampMin = false;
+	Attr.Clamp.bClampMax = false;
+
 	Attr.InitialValue = InitVal;
 	Attr.Init();
 	return Attr;
@@ -61,6 +74,10 @@ void FGMASAttributeSpec::Define()
 		It("sets Value and RawValue to InitialValue when no clamp is configured", [this]()
 		{
 			FAttribute Attr;
+			// Both bounds off. The struct default is an ACTIVE [0, 0] clamp, so "no clamp
+			// configured" is something this test has to arrange, not something it inherits.
+			Attr.Clamp.bClampMin = false;
+			Attr.Clamp.bClampMax = false;
 			Attr.InitialValue = 150.f;
 			Attr.Init();
 			TestEqual("Value == InitialValue after Init", Attr.Value, 150.f);
@@ -71,6 +88,10 @@ void FGMASAttributeSpec::Define()
 		{
 			FAttribute Attr;
 			Attr.InitialValue = 200.f;
+			// Stated rather than inherited: this test is about the bounds being active, so it
+			// should not silently depend on what the struct happens to default them to.
+			Attr.Clamp.bClampMin = true;
+			Attr.Clamp.bClampMax = true;
 			Attr.Clamp.Min = 0.f;
 			Attr.Clamp.Max = 100.f;
 			Attr.Init();
@@ -111,9 +132,11 @@ void FGMASAttributeSpec::Define()
 		It("respects the static clamp when adding modifiers", [this]()
 		{
 			FAttribute Attr = MakeAttr(90.f);
+			// MakeAttr leaves both bounds off; turn them back on for this test.
+			Attr.Clamp.bClampMin = true;
+			Attr.Clamp.bClampMax = true;
 			Attr.Clamp.Min = 0.f;
 			Attr.Clamp.Max = 100.f;
-			Attr.RawValue = 90.f; // Init clamps
 			Attr.AddModifier(MakePermanentMod(50.f)); // would push to 140
 			Attr.CalculateValue();
 			TestEqual("RawValue clamped to Max=100", Attr.RawValue, 100.f);
@@ -186,9 +209,11 @@ void FGMASAttributeSpec::Define()
 			Effect->AddToRoot();
 
 			FAttribute Attr = MakeAttr(80.f);
+			// MakeAttr leaves both bounds off; turn them back on for this test.
+			Attr.Clamp.bClampMin = true;
+			Attr.Clamp.bClampMax = true;
 			Attr.Clamp.Min = 0.f;
 			Attr.Clamp.Max = 100.f;
-			Attr.RawValue = 80.f;
 			Attr.AddModifier(MakeTemporalMod(Effect, 50.f, 1, 1.0)); // would push to 130
 			Attr.CalculateValue();
 
@@ -468,6 +493,9 @@ void FGMASAttributeSpec::Define()
 			Effect->AddToRoot();
 
 			FAttribute Attr = MakeAttr(50.f);
+			// MakeAttr leaves both bounds off; turn them back on for this test.
+			Attr.Clamp.bClampMin = true;
+			Attr.Clamp.bClampMax = true;
 			Attr.Clamp.Min = 0.f;
 			Attr.Clamp.Max = 100.f;
 			Attr.AddModifier(MakeSetMod(Effect, EModifierType::Set, 999.f, 1, 1.0));

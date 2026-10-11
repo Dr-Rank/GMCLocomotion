@@ -12,6 +12,8 @@
 
 #if WITH_AUTOMATION_WORKER
 
+// Arithmetic fixtures explicitly disable bounds: the production default is an active [0, 0] clamp.
+
 BEGIN_DEFINE_SPEC(FGMASAttributeStressSpec,
 	"GMAS.Stress.Attribute",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
@@ -26,7 +28,7 @@ END_DEFINE_SPEC(FGMASAttributeStressSpec)
 
 FAttribute FGMASAttributeStressSpec::MakeAttr(float Init) const
 {
-	FAttribute A; A.InitialValue = Init; A.Init(); return A;
+	FAttribute A; A.Clamp.bClampMin = false; A.Clamp.bClampMax = false; A.InitialValue = Init; A.Init(); return A;
 }
 FGMCAttributeModifier FGMASAttributeStressSpec::MakePerm(float V) const
 {
@@ -255,13 +257,13 @@ void FGMASAttributeStressSpec::Define()
 		});
 		It("InitialValue = FLT_MAX init", [this]()
 		{
-			FAttribute A; A.InitialValue = FLT_MAX; A.Init();
+			FAttribute A; A.Clamp.bClampMin = false; A.Clamp.bClampMax = false; A.InitialValue = FLT_MAX; A.Init();
 			TestEqual("RawValue = FLT_MAX", A.RawValue, FLT_MAX);
 			TestEqual("Value = FLT_MAX", A.Value, FLT_MAX);
 		});
 		It("InitialValue = -FLT_MAX init", [this]()
 		{
-			FAttribute A; A.InitialValue = -FLT_MAX; A.Init();
+			FAttribute A; A.Clamp.bClampMin = false; A.Clamp.bClampMax = false; A.InitialValue = -FLT_MAX; A.Init();
 			TestEqual("RawValue = -FLT_MAX", A.RawValue, -FLT_MAX);
 		});
 	});
@@ -554,14 +556,14 @@ void FGMASAttributeStressSpec::Define()
 	{
 		It("Init() twice with same InitialValue yields same RawValue", [this]()
 		{
-			FAttribute A; A.InitialValue = 50.f; A.Init();
+			FAttribute A; A.Clamp.bClampMin = false; A.Clamp.bClampMax = false; A.InitialValue = 50.f; A.Init();
 			const float First = A.RawValue;
 			A.Init();
 			TestEqual("Idempotent Init", A.RawValue, First);
 		});
 		It("Changing InitialValue and re-Init updates RawValue", [this]()
 		{
-			FAttribute A; A.InitialValue = 50.f; A.Init();
+			FAttribute A; A.Clamp.bClampMin = false; A.Clamp.bClampMax = false; A.InitialValue = 50.f; A.Init();
 			A.InitialValue = 75.f; A.Init();
 			TestEqual("RawValue follows new InitialValue", A.RawValue, 75.f);
 		});
@@ -582,7 +584,7 @@ void FGMASAttributeStressSpec::Define()
 	{
 		It("Negative InitialValue init", [this]()
 		{
-			FAttribute A; A.InitialValue = -50.f; A.Init();
+			FAttribute A; A.Clamp.bClampMin = false; A.Clamp.bClampMax = false; A.InitialValue = -50.f; A.Init();
 			TestEqual("Negative init survives", A.RawValue, -50.f);
 		});
 		It("Negative permanent modifier on positive base", [this]()

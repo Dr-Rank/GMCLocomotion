@@ -26,6 +26,18 @@ END_DEFINE_SPEC(FGMASModifierMathSpec)
 FAttribute FGMASModifierMathSpec::MakeAttr(float InitVal) const
 {
 	FAttribute Attr;
+
+	// ⚠ FAttributeClamp defaults to bClampMin/bClampMax = TRUE with Min/Max = 0, so a
+	// default-constructed attribute carries an ACTIVE [0, 0] clamp and Init() drives InitialValue
+	// to zero. That only shows up in the ops that read Attribute.Value -- AddPercentageMissing
+	// computes InitialValue - Value, which silently became "the whole attribute is missing".
+	//
+	// The two *Clamp ops below are unaffected either way: AddPercentageMaxClamp and
+	// AddPercentageMinClamp read the literal Clamp.Max / Clamp.Min directly and never consult
+	// these flags, so the tests that set those bounds still behave as written.
+	Attr.Clamp.bClampMin = false;
+	Attr.Clamp.bClampMax = false;
+
 	Attr.InitialValue = InitVal;
 	Attr.Init();
 	return Attr;

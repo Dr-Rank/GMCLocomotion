@@ -4,7 +4,13 @@
 #include "GMCAbilitySystem.h"
 #include "GameplayTaskOwnerInterface.h"
 #include "GMCAbilityComponent.h"
-#include "StructUtils/InstancedStruct.h"
+
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5
+#include "StructUtils/InstancedStruct.h"  // UE 5.5+
+#else
+#include "InstancedStruct.h"              // UE 5.4 and earlier
+#endif
+
 #include "Effects/GMCAbilityEffect.h"
 #include "GMCAbility.generated.h"
 
@@ -170,6 +176,11 @@ public:
 	// Remove the ability cost effect (if applicable)
 	UFUNCTION(BlueprintCallable, Category = "GMCAbilitySystem")
 	virtual void RemoveAbilityCost();
+	
+	// Retrieves the attribute costs of this ability from its AbilityCost effect class.
+	// @return A map of GameplayTags (Attributes) to their respective modifier values.
+	UFUNCTION(BlueprintPure, Category = "GMCAbilitySystem")
+	TMap<FGameplayTag, float> GetAbilityCostValues() const;
 
 	// Live modifying the BlockOtherAbility tags
 	UFUNCTION(BlueprintCallable, Category = "GMCAbilitySystem")
@@ -277,6 +288,10 @@ public:
 	// Returns true if the server has confirmed this ability activation.
 	bool IsServerConfirmed() const { return bServerConfirmed; }
 
+	// Local activation time, in ActionTimer units. Diagnostics only: subtract it from the
+	// component's ActionTimer to age an instance that is holding a gate.
+	float GetClientStartTime() const { return ClientStartTime; }
+
 protected:
 
 	// How long to wait for server to confirm ability before cancelling on client
@@ -329,6 +344,10 @@ public:
 
 	
 	TMap<int, EGMCAbilityEffectQueueType> DeclaredEffect;
+
+	// EffectTag of each declared effect, kept as a fallback key. A replay rebuilds ActiveEffects from
+	// the server snapshot under new ids, so the declared id alone can stop resolving.
+	TMap<int, FGameplayTag> DeclaredEffectTags;
 
 		// Queries
 	UPROPERTY(EditDefaultsOnly, Category = "GMCAbilitySystem", meta=(DisplayName="Activation Tags Query"))
