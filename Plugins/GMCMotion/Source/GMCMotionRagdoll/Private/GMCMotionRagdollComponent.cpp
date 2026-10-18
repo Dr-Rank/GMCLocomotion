@@ -100,6 +100,27 @@ namespace GMCMotionRagdoll
 		return FPackageName::DoesPackageExist(FPackageName::ObjectPathToPackageName(FString(ObjectPath)));
 	}
 
+	// Moves the ragdolling mesh component to WorldTarget and leaves its simulated bodies where they are: what a move
+	// without teleport does to them, since it only re-places KINEMATIC bodies, and the mesh re-places those after every
+	// animation evaluation anyway (UpdateKinematicBonesToAnim). Done through MOVECOMP_SkipPhysicsMove because the
+	// editor warns on every non-teleport move of a mesh whose root body simulates ("Attempting to move a fully
+	// simulated skeletal mesh ... Please use the Teleport flag" - once per tick while ragdolling). Teleporting instead
+	// would reset the anim instance's dynamics and broadcast OnSkelMeshPhysicsTeleported. Location and rotation only;
+	// the mesh's scale does not change while ragdolling.
+	void MoveMeshLeavingBodies(USkeletalMeshComponent* Mesh, const FTransform& WorldTarget)
+	{
+		const FBodyInstance* RootBody = Mesh->GetBodyInstance();
+		if (RootBody && RootBody->IsInstanceSimulatingPhysics())
+		{
+			Mesh->MoveComponent(WorldTarget.GetLocation() - Mesh->GetComponentLocation(), WorldTarget.GetRotation(), false,
+				nullptr, MOVECOMP_SkipPhysicsMove, ETeleportType::None);
+		}
+		else
+		{
+			Mesh->SetWorldTransform(WorldTarget, false, nullptr, ETeleportType::None);
+		}
+	}
+
 	// Quantization of the streamed bodies.
 	constexpr float OffsetUnit = 0.5f; // cm per step of the int16 offsets to the pelvis (+-163 m)
 
@@ -1608,7 +1629,14 @@ void UGMCMotionRagdollComponent::ExitRagdollLocal()
 		}
 		UE_CLOG(Mesh->GetAttachParent() != Parent, LogGMCMotionRagdoll, Warning, TEXT("%s: ragdoll mesh not re-attached"), *GetOwner()->GetName());
 	}
-	Mesh->SetRelativeTransform(SavedMeshRelative, false, nullptr, ETeleportType::None);
+	if (const USceneComponent* Parent = Mesh->GetAttachParent())
+	{
+		MoveMeshLeavingBodies(Mesh, SavedMeshRelative * Parent->GetSocketTransform(Mesh->GetAttachSocketName()));
+	}
+	else
+	{
+		MoveMeshLeavingBodies(Mesh, SavedMeshRelative * GetOwner()->GetActorTransform());
+	}
 	if (Snapshot && Snapshot->bIsValid && Snapshot->LocalTransforms.Num() > 0)
 	{
 		Snapshot->LocalTransforms[0] = Snapshot->LocalTransforms[0] * OldComponent * Mesh->GetComponentTransform().Inverse();
@@ -1854,7 +1882,7 @@ void UGMCMotionRagdollComponent::TickComponent(float DeltaTime, ELevelTick TickT
 	// teleports the capsule on corrections): it is moved along without teleport, the simulated bodies stay where they are.
 	if (Mesh->GetAttachParent() == nullptr)
 	{
-		Mesh->SetWorldTransform(SavedMeshRelative * GetOwner()->GetActorTransform(), false, nullptr, ETeleportType::None);
+		MoveMeshLeavingBodies(Mesh, SavedMeshRelative * GetOwner()->GetActorTransform());
 	}
 	PushAnimValues();
 }
