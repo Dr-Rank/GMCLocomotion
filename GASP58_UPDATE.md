@@ -28,7 +28,7 @@ Everything stays GMC-replicated (prediction, replays, simulated proxies).
 - Air traversal catches (GASP 5.8): grabbing ledges while falling.
 
 **Slope slide** (GMC movement mode `Custom2`)
-- **This project: crouch while sprinting** on a downhill floor of 15 deg or more starts it; releasing crouch (or the slide
+- **This project: crouch while sprinting** on a downhill floor of 20 deg or more starts it; releasing crouch (or the slide
   running out) ends it. Comes from `BP_GMCMovement`'s defaults: `bSlopeSlideAutoStart` off and
   `SlopeSlideRequestProperty = WantsToCrouch`, so the GMC-bound crouch input is the request, read inside the move.
 - The slide keeps the speed the pawn ran in with (it used to lose a factor of cos(slope) on the first frame:
