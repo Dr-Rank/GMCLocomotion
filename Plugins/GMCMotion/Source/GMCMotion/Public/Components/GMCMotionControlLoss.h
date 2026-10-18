@@ -21,4 +21,8 @@ class GMCMOTION_API IGMCMotionControlLossSource
 public:
 	// True while the player has no control of the pawn. Read on the owning client only (the camera limit is local).
 	virtual bool IsPlayerControlLost() const = 0;
+
+	// True while the control loss is a get-up (the body follows a montage now, it no longer tumbles): UGMCMotion turns the
+	// view to the pawn's facing then (GetUpViewAlignTime) instead of holding it on the facing at the loss of control.
+	virtual bool IsGettingUp() const { return false; }
 };

@@ -1136,6 +1136,17 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Camera", meta = (ClampMin = "0", ClampMax = "180"))
 	float KnockdownCameraYawRange = 0.f;
 
+	// With KnockdownCameraYawRange: when the get-up starts the view turns to the direction the body gets up facing over
+	// this long (s), and the window then follows the body for the rest of the get-up. The capsule turns with the
+	// tumbling body while it is down, so the get-up can face anywhere: with the window still held on the facing at the
+	// knockdown, a first-person view looked at the rising body side-on and the body snapped round to the view once
+	// standing (measured in CLEAR: got up facing 234 with the view held at 180). 0 = no turn.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Camera", meta = (ClampMin = "0"))
+	float GetUpViewAlignTime = 0.35f;
+
+	// The view yaw Alpha (0..1, eased) of the way from FromYaw to ToYaw, turning the short way round.
+	static float ComputeGetUpViewYaw(float FromYaw, float ToYaw, float Alpha);
+
 	// Optional: a bool on the owning pawn (e.g. bFirstPersonView) that must be true for either limit to apply, so a
 	// third-person view stays free. None = the limits always apply.
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "GMCMotion|Camera")
@@ -1445,6 +1456,11 @@ private:
 	bool bCameraYawLimited = false;
 	bool bCameraYawLimitHeld = false;
 	float CameraYawLimitCentre = 0.f;
+	// The get-up view turn (GetUpViewAlignTime): started for this get-up, finished, the yaw it started from, time spent.
+	bool bGetUpViewAlignStarted = false;
+	bool bGetUpViewAligned = false;
+	float GetUpViewAlignFromYaw = 0.f;
+	float GetUpViewAlignElapsed = 0.f;
 	// The camera manager's values before the limit, restored when it lifts.
 	float SavedViewYawMin = 0.f;
 	float SavedViewYawMax = 359.998993f;

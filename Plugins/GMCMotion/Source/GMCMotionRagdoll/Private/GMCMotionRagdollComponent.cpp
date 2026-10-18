@@ -871,7 +871,11 @@ void UGMCMotionRagdollComponent::UpdateRagdollCamera(float DeltaTime)
 	static const FName ArmLengthName(TEXT("ArmLength"));
 	static const FName VerticalOffsetName(TEXT("VerticalOffset"));
 	USkeletalMeshComponent* Mesh = GetMesh();
-	const bool bWanted = bRagdollCamera && Mesh && IsLocallyControlledPawn()
+	if (!bLocalRagdollActive && LocalPhase == EGMCMotionRagdollPhase::None)
+	{
+		bFirstPersonRagdollActive = false;
+	}
+	const bool bWanted = bRagdollCamera && !bFirstPersonRagdollActive && Mesh && IsLocallyControlledPawn()
 		&& (bLocalRagdollActive || LocalPhase == EGMCMotionRagdollPhase::Ragdoll || LocalPhase == EGMCMotionRagdollPhase::GettingUp
 			|| LocalPhase == EGMCMotionRagdollPhase::Dead);
 	if (bWanted && !bRagdollCameraActive)
@@ -1700,6 +1704,13 @@ void UGMCMotionRagdollComponent::SetViewModeForRagdoll(bool bRagdoll)
 	static const FName ApplyViewMode(TEXT("ApplyViewMode"));
 	if (bRagdoll)
 	{
+		// First-person ragdoll: stay on the head, nothing to switch or restore.
+		bFirstPersonRagdollActive = bFirstPersonRagdoll && GetBool(Owner, FirstPersonView, false);
+		if (bFirstPersonRagdollActive)
+		{
+			bSavedFirstPersonView = false;
+			return;
+		}
 		bSavedFirstPersonView = GetBool(Owner, FirstPersonView, false);
 		if (bSavedFirstPersonView)
 		{

@@ -30,6 +30,8 @@ void FSlopeSlideDefaultsSpec::Define()
 			TestEqual("SlopeSlideCameraYawRange", Defaults->SlopeSlideCameraYawRange, 0.f);
 			TestEqual("KnockdownCameraYawRange", Defaults->KnockdownCameraYawRange, 0.f);
 			TestTrue("no camera condition", Defaults->CameraYawLimitConditionProperty.IsNone());
+			// The get-up view turn only acts inside the knockdown limit, which stays off.
+			TestEqual("GetUpViewAlignTime", Defaults->GetUpViewAlignTime, 0.35f);
 		});
 
 		It("reads no request bool until one is named", [this]()

@@ -52,7 +52,13 @@ release (`bSlopeSlideEndOnRelease`).
 **Camera yaw limit.** `SlopeSlideCameraYawRange` and `KnockdownCameraYawRange` (0 = off)
 limit the local player's view yaw around the pawn's facing while sliding or out of control,
 optionally only while a bool on the pawn is true (`CameraYawLimitConditionProperty`, e.g.
-a first-person flag).
+a first-person flag). When a get-up starts, the view turns to the direction the body gets
+up facing (`GetUpViewAlignTime`).
+
+**First-person ragdoll.** `bFirstPersonRagdoll` on `UGMCMotionRagdollComponent` keeps a
+first-person pawn on its head camera while down and getting up, instead of switching to the
+third-person ragdoll camera. Console: `gmc.Ragdoll.FirstPerson [0|1]`; debug
+`gmc.Ragdoll.Knockdown`, `GetUp`, `Report`, `Trace`.
 
 **Version.** `Version` in `GMCMotion.uplugin`, and the `GMCMOTION_VERSION` define, is 2
 from this release (requested slide, camera limit, GMCMotionRagdoll).

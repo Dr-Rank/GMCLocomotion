@@ -6,6 +6,8 @@
 #include "GMCMotionRagdollComponent.h"
 #include "Engine/World.h"
 #include "TimerManager.h"
+#include "Containers/Ticker.h"
+#include "Camera/PlayerCameraManager.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "Components/SkeletalMeshComponent.h"
@@ -134,4 +136,68 @@ static FAutoConsoleCommandWithWorldAndArgs GGMCMotionRagdollReport(
 		{
 			GMCMotionRagdollReport(World);
 		}), Delay, false);
+	}));
+
+// gmc.Ragdoll.FirstPerson [0|1]: sets (or with no argument flips) bFirstPersonRagdoll on the local player's pawn in this
+// world. Applies from the next knockdown.
+static FAutoConsoleCommandWithWorldAndArgs GGMCMotionRagdollFirstPerson(
+	TEXT("gmc.Ragdoll.FirstPerson"),
+	TEXT("gmc.Ragdoll.FirstPerson [0|1]: first-person ragdoll on the local pawn (no argument flips it); next knockdown."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
+	{
+		const APlayerController* LocalPC = World ? World->GetFirstPlayerController() : nullptr;
+		const APawn* Pawn = LocalPC ? LocalPC->GetPawn() : nullptr;
+		UGMCMotionRagdollComponent* Ragdoll = Pawn ? Pawn->FindComponentByClass<UGMCMotionRagdollComponent>() : nullptr;
+		if (!Ragdoll)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("gmc.Ragdoll.FirstPerson: no local pawn with a ragdoll component"));
+			return;
+		}
+		Ragdoll->bFirstPersonRagdoll = Args.Num() > 0 ? FCString::Atoi(*Args[0]) != 0 : !Ragdoll->bFirstPersonRagdoll;
+		UE_LOG(LogTemp, Log, TEXT("gmc.Ragdoll.FirstPerson: %d on %s (from the next knockdown)"),
+			Ragdoll->bFirstPersonRagdoll ? 1 : 0, *Pawn->GetName());
+	}));
+
+// gmc.Ragdoll.Trace [Seconds=10]: logs, every frame for Seconds, the local pawn's ragdoll phase, whether the view is first
+// person (the owner's bFirstPersonView), its facing, the view (control) yaw, the camera yaw window and the camera's
+// distance from the head bone - for tuning the knockdown camera and first-person ragdoll (bFirstPersonRagdoll).
+static FAutoConsoleCommandWithWorldAndArgs GGMCMotionRagdollTrace(
+	TEXT("gmc.Ragdoll.Trace"),
+	TEXT("gmc.Ragdoll.Trace [Seconds=10]: log the local pawn's ragdoll phase, view and camera every frame."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
+	{
+		if (!World)
+		{
+			return;
+		}
+		const double Seconds = Args.Num() > 0 ? FCString::Atod(*Args[0]) : 10.;
+		const double EndTime = FPlatformTime::Seconds() + Seconds;
+		TWeakObjectPtr<UWorld> WeakWorld = World;
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([WeakWorld, EndTime](float)
+		{
+			UWorld* W = WeakWorld.Get();
+			if (!W || FPlatformTime::Seconds() > EndTime)
+			{
+				return false;
+			}
+			APlayerController* PC = W->GetFirstPlayerController();
+			APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+			const UGMCMotionRagdollComponent* Ragdoll = Pawn ? Pawn->FindComponentByClass<UGMCMotionRagdollComponent>() : nullptr;
+			if (!Ragdoll)
+			{
+				return true;
+			}
+			const FBoolProperty* FirstPerson = FindFProperty<FBoolProperty>(Pawn->GetClass(), TEXT("bFirstPersonView"));
+			const bool bFirstPerson = FirstPerson && FirstPerson->GetPropertyValue_InContainer(Pawn);
+			const APlayerCameraManager* Camera = PC->PlayerCameraManager;
+			const USkeletalMeshComponent* Mesh = Pawn->FindComponentByClass<USkeletalMeshComponent>();
+			const double HeadDistance = Camera && Mesh && Mesh->GetBoneIndex(TEXT("head")) != INDEX_NONE
+				? FVector::Dist(Camera->GetCameraLocation(), Mesh->GetBoneLocation(TEXT("head"))) : -1.;
+			UE_LOG(LogTemp, Log, TEXT("gmc.Ragdoll.Trace t=%.3f phase=%s fp=%d fpRagdoll=%d facing=%.1f view=%.1f window=[%.1f,%.1f] camYaw=%.1f camHead=%.1f"),
+				W->GetTimeSeconds(), *UEnum::GetValueAsString(Ragdoll->GetPhase()), bFirstPerson ? 1 : 0,
+				Ragdoll->IsFirstPersonRagdollActive() ? 1 : 0, Pawn->GetActorRotation().Yaw, PC->GetControlRotation().Yaw,
+				Camera ? Camera->ViewYawMin : 0.f, Camera ? Camera->ViewYawMax : 0.f,
+				Camera ? Camera->GetCameraRotation().Yaw : 0., HeadDistance);
+			return true;
+		}));
 	}));

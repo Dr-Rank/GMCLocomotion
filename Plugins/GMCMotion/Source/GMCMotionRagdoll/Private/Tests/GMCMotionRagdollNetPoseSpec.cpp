@@ -95,3 +95,20 @@ void FGMCMotionRagdollNetPoseSpec::Define()
 }
 
 #endif
+
+#if WITH_DEV_AUTOMATION_TESTS
+BEGIN_DEFINE_SPEC(FGMCMotionRagdollDefaultsSpec, "GMCMotion.Unit.RagdollDefaults",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+END_DEFINE_SPEC(FGMCMotionRagdollDefaultsSpec)
+
+void FGMCMotionRagdollDefaultsSpec::Define()
+{
+	It("switches to the third-person ragdoll camera unless first-person ragdoll is turned on", [this]()
+	{
+		const UGMCMotionRagdollComponent* Defaults = GetDefault<UGMCMotionRagdollComponent>();
+		TestFalse("bFirstPersonRagdoll", Defaults->bFirstPersonRagdoll);
+		TestTrue("bRagdollCamera", Defaults->bRagdollCamera);
+		TestFalse("not active outside a knockdown", Defaults->IsFirstPersonRagdollActive());
+	});
+}
+#endif

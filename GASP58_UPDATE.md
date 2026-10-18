@@ -45,6 +45,11 @@ Everything stays GMC-replicated (prediction, replays, simulated proxies).
 `GMCMotionRagdoll` module)
 - Server-authoritative active ragdoll streamed to clients, motion-matched get-ups (stand / roll).
 - `B` toggles the ragdoll, `Space` gets up. `,` shove / tackle, `.` takedown (two-character interactions).
+- First person switches to the third-person ragdoll camera while down by default. `bFirstPersonRagdoll` on the ragdoll
+  component (console `gmc.Ragdoll.FirstPerson [0|1]`) keeps first person on the head instead; the view is held on the
+  facing at the knockdown, then turned to the direction the body gets up facing (`GetUpViewAlignTime`, 0.35 s).
+- Debug (server world): `gmc.Ragdoll.Knockdown [self|others|all] [Impulse]`, `gmc.Ragdoll.GetUp [who] [Delay]`,
+  `gmc.Ragdoll.Report [Delay]`, `gmc.Ragdoll.Trace [Seconds]` (per-frame phase, view, camera window).
 - Knockdown and hit reactions from impacts: call `AddHitImpulse` from your damage code.
 - GMAS death: `Health <= 0` -> `GE_Dead` (`State.Dead`) -> dead ragdoll, respawn after `RespawnDelay`.
 
@@ -72,6 +77,12 @@ Everything stays GMC-replicated (prediction, replays, simulated proxies).
 - New engine plugin dependency: `PhysicsControl` (declared by GMCMotion).
 - The ragdoll classes were renamed from `GMCGASP*` (game module) to `GMCMotion*` (plugin); `[CoreRedirects]` in
   `Config/DefaultEngine.ini` keeps existing assets loading.
+
+## MCP
+
+Unreal's MCP server starts with the editor (`http://localhost:8000/mcp`, `bAutoStartServer` in
+`Config/DefaultEditorPerProjectUserSettings.ini`; plugins ModelContextProtocol, MCPClientToolset, AllToolsets).
+`.mcp.json` points an MCP client opened in this folder at it.
 
 ## Test map
 

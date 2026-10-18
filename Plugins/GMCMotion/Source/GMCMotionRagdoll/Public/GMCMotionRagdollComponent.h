@@ -277,6 +277,14 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Ragdoll|Camera")
 	bool bRagdollCamera = true;
 
+	/** First-person ragdoll: a pawn in first person at the knockdown (the owner's bFirstPersonView) stays in first
+	 * person while down and getting up - the camera rides the head - instead of switching to the third-person ragdoll
+	 * camera. Decided at each knockdown, so changing it while down applies from the next one. With UGMCMotion's
+	 * KnockdownCameraYawRange the view is held on the facing at the knockdown, then turned to the get-up facing
+	 * (GetUpViewAlignTime). Console: gmc.Ragdoll.FirstPerson [0|1]. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ragdoll|Camera")
+	bool bFirstPersonRagdoll = false;
+
 	UPROPERTY(EditAnywhere, Category = "Ragdoll|Camera")
 	FName RagdollCameraRigName = TEXT("ShoulderCameraRig");
 
@@ -375,6 +383,11 @@ public:
 	}
 
 	virtual bool IsPlayerControlLost() const override { return IsOutOfPlayerControl(); }
+	virtual bool IsGettingUp() const override { return State.Phase == EGMCMotionRagdollPhase::GettingUp; }
+
+	/** True while this knockdown stays in first person (bFirstPersonRagdoll and the pawn was in first person). */
+	UFUNCTION(BlueprintPure, Category = "Ragdoll|Camera")
+	bool IsFirstPersonRagdollActive() const { return bFirstPersonRagdollActive; }
 
 	// --- Setup -------------------------------------------------------------------------------------------------------
 
@@ -853,6 +866,8 @@ private:
 	ECollisionResponse SavedCapsulePawnResponse = ECR_Block;
 	ECollisionResponse SavedCapsuleCameraResponse = ECR_Block;
 	bool bSavedFirstPersonView = false;
+	// This knockdown stays in first person (decided in SetViewModeForRagdoll(true), cleared once standing).
+	bool bFirstPersonRagdollActive = false;
 	TWeakObjectPtr<USceneComponent> SavedSmoothComponent;
 
 	// Server behaviours state.
