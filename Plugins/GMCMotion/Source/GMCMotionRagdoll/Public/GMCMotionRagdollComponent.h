@@ -4,7 +4,8 @@
 #include "Components/ActorComponent.h"
 #include "GameplayTagContainer.h"
 #include "PoseSearch/PoseSearchConstraints.h"
-#include "GMCGASPRagdollComponent.generated.h"
+#include "Components/GMCMotionControlLoss.h"
+#include "GMCMotionRagdollComponent.generated.h"
 
 class UAnimMontage;
 class UGMCAbilityEffect;
@@ -19,7 +20,7 @@ class USkeletalMeshComponent;
 
 /** Pose the ragdoll's anim graph shows on the ground (GASP58 E_RagdollInjuryState, same order). */
 UENUM(BlueprintType)
-enum class EGMCGASPRagdollInjury : uint8
+enum class EGMCMotionRagdollInjury : uint8
 {
 	None,
 	Limp,
@@ -31,7 +32,7 @@ enum class EGMCGASPRagdollInjury : uint8
 };
 
 UENUM(BlueprintType)
-enum class EGMCGASPRagdollPhase : uint8
+enum class EGMCMotionRagdollPhase : uint8
 {
 	None,
 	Ragdoll,
@@ -44,7 +45,7 @@ enum class EGMCGASPRagdollPhase : uint8
 /** GASP58 interaction request (CHT_CharacterInteractionPSDs input). A shove becomes a tackle at run speed (chooser rows);
  * Tackle is kept for the old callers and searches like Shove. */
 UENUM(BlueprintType)
-enum class EGMCGASPInteractionType : uint8
+enum class EGMCMotionInteractionType : uint8
 {
 	Shove,
 	Tackle,
@@ -54,12 +55,12 @@ enum class EGMCGASPInteractionType : uint8
 /** One row of GASP58's CHT_CharacterInteractionPSDs: the pose search database of an interaction type within a speed
  * band of the initiator, and the roles each side can take in it. */
 USTRUCT(BlueprintType)
-struct FGMCGASPInteractionDatabase
+struct FGMCMotionInteractionDatabase
 {
 	GENERATED_BODY()
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Interaction")
-	EGMCGASPInteractionType Type = EGMCGASPInteractionType::Shove;
+	EGMCMotionInteractionType Type = EGMCMotionInteractionType::Shove;
 
 	/** Initiator speed band (cm/s, GASP Get_Speed): Min included, Max excluded. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Interaction")
@@ -80,15 +81,15 @@ struct FGMCGASPInteractionDatabase
 
 /** Server-decided ragdoll state, replicated to every machine. */
 USTRUCT()
-struct FGMCGASPRagdollState
+struct FGMCMotionRagdollState
 {
 	GENERATED_BODY()
 
 	UPROPERTY()
-	EGMCGASPRagdollPhase Phase = EGMCGASPRagdollPhase::None;
+	EGMCMotionRagdollPhase Phase = EGMCMotionRagdollPhase::None;
 
 	UPROPERTY()
-	EGMCGASPRagdollInjury Injury = EGMCGASPRagdollInjury::None;
+	EGMCMotionRagdollInjury Injury = EGMCMotionRagdollInjury::None;
 
 	/** Incremented on every server transition, so a client that missed one still applies the latest. */
 	UPROPERTY()
@@ -140,7 +141,7 @@ struct FGMCGASPRagdollState
 
 /** One sample of the server's bodies: the pelvis in world space, every other body relative to it (quantized). */
 USTRUCT()
-struct FGMCGASPRagdollNetPose
+struct FGMCMotionRagdollNetPose
 {
 	GENERATED_BODY()
 
@@ -162,7 +163,7 @@ struct FGMCGASPRagdollNetPose
 };
 
 template<>
-struct TStructOpsTypeTraits<FGMCGASPRagdollNetPose> : public TStructOpsTypeTraitsBase2<FGMCGASPRagdollNetPose>
+struct TStructOpsTypeTraits<FGMCMotionRagdollNetPose> : public TStructOpsTypeTraitsBase2<FGMCMotionRagdollNetPose>
 {
 	enum { WithNetSerializer = true };
 };
@@ -183,13 +184,13 @@ struct TStructOpsTypeTraits<FGMCGASPRagdollNetPose> : public TStructOpsTypeTrait
  *    the right hand otherwise.
  * Lives on the pawn (BP_GMC_Pawn).
  */
-UCLASS(ClassGroup = (GMCGASP), meta = (BlueprintSpawnableComponent))
-class GMCGASP_API UGMCGASPRagdollComponent : public UActorComponent
+UCLASS(ClassGroup = (GMC), meta = (BlueprintSpawnableComponent))
+class GMCMOTIONRAGDOLL_API UGMCMotionRagdollComponent : public UActorComponent, public IGMCMotionControlLossSource
 {
 	GENERATED_BODY()
 
 public:
-	UGMCGASPRagdollComponent();
+	UGMCMotionRagdollComponent();
 
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
@@ -198,7 +199,7 @@ public:
 
 	/** Server: puts the pawn into ragdoll (ignored when dead or already ragdolling). */
 	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Ragdoll")
-	void TriggerRagdoll(EGMCGASPRagdollInjury Injury, FVector Impulse, FVector ImpulseLocation);
+	void TriggerRagdoll(EGMCMotionRagdollInjury Injury, FVector Impulse, FVector ImpulseLocation);
 
 	/** Server: gets up (ignored unless ragdolling). bForce skips the "on the floor" check. */
 	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Ragdoll")
@@ -218,9 +219,10 @@ public:
 	static void RegisterPendingDamage(AActor* Target, float HealthDelta);
 
 	UFUNCTION(BlueprintPure, Category = "Ragdoll")
-	bool IsDead() const { return State.Phase == EGMCGASPRagdollPhase::Dead; }
+	bool IsDead() const { return State.Phase == EGMCMotionRagdollPhase::Dead; }
 
-	/** Death decided by the server as soon as the damage in flight is lethal (RegisterPendingDamage). */
+	/** Death decided by the server as soon as the damage in flight is lethal (RegisterPendingDamage). Turn it off when
+	 * lethal damage does not kill at once (e.g. a downed state first), or it ragdolls a pawn that is only going down. */
 	UPROPERTY(EditAnywhere, Category = "Ragdoll|Death")
 	bool bEarlyServerDeath = true;
 
@@ -261,7 +263,7 @@ public:
 	float KnockdownDecayPerSecond = 750.f;
 
 	UPROPERTY(EditAnywhere, Category = "Ragdoll|Knockdown")
-	EGMCGASPRagdollInjury KnockdownInjury = EGMCGASPRagdollInjury::None;
+	EGMCMotionRagdollInjury KnockdownInjury = EGMCMotionRagdollInjury::None;
 
 	/** Kick of the bullet that knocks the pawn down (kg*cm/s, along the flattened bullet direction, slightly up). */
 	UPROPERTY(EditAnywhere, Category = "Ragdoll|Knockdown", meta = (ClampMin = 0.))
@@ -318,20 +320,20 @@ public:
 	void RequestToggleRagdoll();
 
 	UFUNCTION(BlueprintPure, Category = "Ragdoll")
-	EGMCGASPRagdollPhase GetPhase() const { return State.Phase; }
+	EGMCMotionRagdollPhase GetPhase() const { return State.Phase; }
 
 	// --- Character interactions (GASP58 TryCharacterInteraction) ----------------------------------------------------
 
 	/** Owning client or server: interaction with the characters in front (input). */
 	UFUNCTION(BlueprintCallable, Category = "Ragdoll|Interaction")
-	void RequestInteraction(EGMCGASPInteractionType Type);
+	void RequestInteraction(EGMCMotionInteractionType Type);
 
 	/** Server: GASP58 Try_MultiCharacterInteraction. The chooser rows (InteractionDatabases) give the databases for Type
 	 * and this pawn's speed; MotionMatchMulti searches them with this pawn as initiator and every interactable
 	 * character (CheckForInteractableCharacters, or only Target when given) as target, and every character of the best
 	 * result plays its role's montage from the matched time. False when nothing started. */
 	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Ragdoll|Interaction")
-	bool TryInteraction(EGMCGASPInteractionType Type, AActor* Target = nullptr);
+	bool TryInteraction(EGMCMotionInteractionType Type, AActor* Target = nullptr);
 
 	/** GASP58 CanDoCharacterInteraction: on the ground, no montage in DefaultSlot, not aiming. */
 	UFUNCTION(BlueprintPure, Category = "Ragdoll|Interaction")
@@ -350,10 +352,48 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Ragdoll")
 	static bool IsActorRagdolling(const AActor* Actor);
 
+	/** True while the actor's ragdoll is up (knocked down or dead). Use it to gate logic that must run once per death
+	 * (e.g. a death chain on the movement Blueprint), not every tick on a corpse. */
+	UFUNCTION(BlueprintPure, Category = "Ragdoll", meta = (DefaultToSelf = "Actor"))
+	static bool IsDeathRagdollActive(const AActor* Actor);
+
+	/** The replicated phase (None, Ragdoll = knocked down, GettingUp, Dead, Interacting). */
 	UFUNCTION(BlueprintPure, Category = "Ragdoll")
-	bool IsRagdolling() const { return State.Phase == EGMCGASPRagdollPhase::Ragdoll || State.Phase == EGMCGASPRagdollPhase::Dead; }
+	EGMCMotionRagdollPhase GetRagdollPhase() const { return State.Phase; }
+
+	UFUNCTION(BlueprintPure, Category = "Ragdoll")
+	bool IsRagdolling() const { return State.Phase == EGMCMotionRagdollPhase::Ragdoll || State.Phase == EGMCMotionRagdollPhase::Dead; }
+
+	/** Knocked down, getting up, or the target of a shove / tackle / takedown - the player has no control of the
+	 * pawn until this turns false. The initiator of an interaction is still in control. UGMCMotion holds its
+	 * KnockdownCameraYawRange on this (IGMCMotionControlLossSource). */
+	UFUNCTION(BlueprintPure, Category = "Ragdoll")
+	bool IsOutOfPlayerControl() const
+	{
+		return State.Phase == EGMCMotionRagdollPhase::Ragdoll || State.Phase == EGMCMotionRagdollPhase::GettingUp
+			|| (State.Phase == EGMCMotionRagdollPhase::Interacting && !State.bInitiator);
+	}
+
+	virtual bool IsPlayerControlLost() const override { return IsOutOfPlayerControl(); }
 
 	// --- Setup -------------------------------------------------------------------------------------------------------
+
+	/** Byte / enum property of the movement component the ragdoll writes its action to (GMCLocomotion's MovementAction
+	 * enum: 0 None, 1 Ragdoll, 2 GettingUp), read by the ABP. None = write nothing. */
+	UPROPERTY(EditAnywhere, Category = "Ragdoll|Setup")
+	FName MovementActionProperty = TEXT("MovementAction");
+
+	/** The MovementActionProperty values for none / ragdoll / getting up. The defaults are GMCLocomotion's enum; change
+	 * them when the property is another enum (e.g. an ALS-style MovementAction: None 0, Mantling 1, Ragdoll 2,
+	 * GettingUp 3). */
+	UPROPERTY(EditAnywhere, Category = "Ragdoll|Setup")
+	uint8 MovementActionNoneValue = 0;
+
+	UPROPERTY(EditAnywhere, Category = "Ragdoll|Setup")
+	uint8 MovementActionRagdollValue = 1;
+
+	UPROPERTY(EditAnywhere, Category = "Ragdoll|Setup")
+	uint8 MovementActionGettingUpValue = 2;
 
 	/** Name of the third-person skeletal mesh component that ragdolls. */
 	UPROPERTY(EditAnywhere, Category = "Ragdoll|Setup")
@@ -410,9 +450,15 @@ public:
 
 	// --- Interactions ----------------------------------------------------------------------------------------------------
 
-	/** GASP58 CHT_CharacterInteractionPSDs rows (the default databases are loaded when empty). */
+	/** GASP58 CHT_CharacterInteractionPSDs rows (the default databases are loaded when empty and
+	 * bLoadDefaultInteractionDatabases is set). */
 	UPROPERTY(EditAnywhere, Category = "Ragdoll|Interaction")
-	TArray<FGMCGASPInteractionDatabase> InteractionDatabases;
+	TArray<FGMCMotionInteractionDatabase> InteractionDatabases;
+
+	/** Load GASP58's interaction databases (shove, tackle, takedown) from their /Game paths when InteractionDatabases is
+	 * empty. Turn it off in a project without that content. */
+	UPROPERTY(EditAnywhere, Category = "Ragdoll|Interaction")
+	bool bLoadDefaultInteractionDatabases = true;
 
 	UPROPERTY(EditAnywhere, Category = "Ragdoll|Interaction")
 	TObjectPtr<UInputAction> ShoveAction;
@@ -481,6 +527,27 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Ragdoll|GetUp")
 	float BotGetUpMaxDelay = 8.f;
 
+	/** A bot still down after this long gets up whatever its body is doing (0 = never). BotGetUpMaxDelay only retries a
+	 * non-forced exit, which refuses while the body moves: a body that cannot settle (spawned inside a prop's collision -
+	 * every body at 1-5 m/s, never moving, measured in CLEAR) stays down for good without this. Matters for hordes. */
+	UPROPERTY(EditAnywhere, Category = "Ragdoll|GetUp", meta = (ClampMin = 0.))
+	float BotForceGetUpDelay = 0.f;
+
+	/** Sockets of the mesh whose attached items are held in the hand. A knockdown moves them onto HeldItemHandBone,
+	 * keeping their exact held offset, and the end of the get-up puts them back. Needed for any socket on a bone with no
+	 * physics body (e.g. ik_hand_gun, an IK bone under ik_hand_root): during the ragdoll it follows the animation, and a
+	 * gun attached there floated ~90 cm from the simulated hand (measured in CLEAR). Empty = off. */
+	UPROPERTY(EditAnywhere, Category = "Ragdoll|HeldItems")
+	TArray<FName> HeldItemSockets;
+
+	/** The physics-simulated bone held items ride during a knockdown. */
+	UPROPERTY(EditAnywhere, Category = "Ragdoll|HeldItems")
+	FName HeldItemHandBone = TEXT("hand_r");
+
+	/** Players get up the way bots do (still for BotGetUpDelay, or BotGetUpMaxDelay) instead of asking (GetUpAction). */
+	UPROPERTY(EditAnywhere, Category = "Ragdoll|GetUp")
+	bool bPlayersGetUpAutomatically = false;
+
 	/** Players can only get up on the floor, under this speed. */
 	UPROPERTY(EditAnywhere, Category = "Ragdoll|GetUp")
 	float PlayerGetUpMaxSpeed = 100.f;
@@ -548,6 +615,17 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Ragdoll|Network")
 	float SettleTime = 1.f;
 
+	/** Once settled, the server re-captures FinalPose when any body has moved more than this from it (cm), checked every
+	 * FinalPoseRecheckInterval. A body still sliding under SettleSpeed kept going after the capture: a client held a final
+	 * pose 9 cm (a foot 20 cm) off the server's corpse for good (measured in CLEAR, 2-player PIE). */
+	UPROPERTY(EditAnywhere, Category = "Ragdoll|Network", meta = (ClampMin = 0.1))
+	float FinalPoseTolerance = 2.f;
+
+	UPROPERTY(EditAnywhere, Category = "Ragdoll|Network", meta = (ClampMin = 0.05))
+	float FinalPoseRecheckInterval = 0.5f;
+
+	float FinalPoseRecheckTimer = 0.f;
+
 	// --- Obstacles (GASP58 TraceForObstacles) --------------------------------------------------------------------------
 
 	/** Server: a sphere from the neck to between the feet; an Obstacle object in it knocks the pawn down. Obstacles may
@@ -572,7 +650,7 @@ protected:
 	void OnRep_FinalPose();
 
 	UFUNCTION(NetMulticast, Unreliable)
-	void MulticastPose(const FGMCGASPRagdollNetPose& Pose);
+	void MulticastPose(const FGMCMotionRagdollNetPose& Pose);
 
 	UFUNCTION(Server, Reliable)
 	void ServerRequestToggleRagdoll();
@@ -581,7 +659,7 @@ protected:
 	void ServerRequestGetUp();
 
 	UFUNCTION(Server, Reliable)
-	void ServerRequestInteraction(EGMCGASPInteractionType Type);
+	void ServerRequestInteraction(EGMCMotionInteractionType Type);
 
 	UFUNCTION(NetMulticast, Unreliable)
 	void MulticastHitReaction(FName Bone, FVector_NetQuantize10 Impulse, FVector_NetQuantize Location);
@@ -606,11 +684,11 @@ protected:
 
 private:
 	UPROPERTY(ReplicatedUsing = OnRep_State)
-	FGMCGASPRagdollState State;
+	FGMCMotionRagdollState State;
 
 	/** Last pose of a settled corpse (reliable, late joiners). */
 	UPROPERTY(ReplicatedUsing = OnRep_FinalPose)
-	FGMCGASPRagdollNetPose FinalPose;
+	FGMCMotionRagdollNetPose FinalPose;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UPhysicsControlComponent> PhysicsControl;
@@ -622,9 +700,24 @@ private:
 	double GetServerTime() const;
 
 	void SetupPhysicsControl();
-	void ApplyPhase(EGMCGASPRagdollPhase NewPhase, EGMCGASPRagdollPhase OldPhase);
+	/** Destroys the physics control component and restores the mesh's update mode, unconditionally. A standing mesh with
+	 * no collision has no bodies: the controls are made per ragdoll, once the Ragdoll profile has created the bodies, and
+	 * released when the bodies go away again. */
+	void ReleasePhysicsControl();
+	void ApplyPhase(EGMCMotionRagdollPhase NewPhase, EGMCMotionRagdollPhase OldPhase);
 	void EnterRagdollLocal(bool bDead);
 	void ExitRagdollLocal();
+	/** HeldItemSockets -> HeldItemHandBone at the knockdown, and back once the get-up montage is over. */
+	void RebindHeldItemsToHand();
+	void RestoreHeldItems();
+	struct FReboundHeldItem
+	{
+		TWeakObjectPtr<USceneComponent> Component;
+		FName Socket;
+		FTransform Relative;
+	};
+	TArray<FReboundHeldItem> ReboundHeldItems;
+	TWeakObjectPtr<UAnimMontage> HeldItemsGetUpMontage;
 	void FinishGetUp();
 	void SetMovementAction(uint8 Action);
 	void SetViewModeForRagdoll(bool bRagdoll);
@@ -642,7 +735,7 @@ private:
 	void ApplyPhysicalCollision(bool bForce = false);
 	void RestorePhysicalCollision();
 	// Console switches applied live (gmc.Mesh.TickAfterGMCMoves, gmc.Ragdoll.PhysicsLayer).
-	friend struct FGMCGASPRagdollCVars;
+	friend struct FGMCMotionRagdollCVars;
 	void ApplyMeshTickOrder();
 	void ApplyPhysicsLayerSwitch();
 	bool bMeshTickChained = false;
@@ -716,11 +809,11 @@ private:
 	void PushAnimValues();
 
 	// Pose streaming.
-	bool CapturePose(FGMCGASPRagdollNetPose& OutPose) const;
+	bool CapturePose(FGMCMotionRagdollNetPose& OutPose) const;
 	void ServerStreamPose(float DeltaTime);
 	void ClientFollowPose(float DeltaTime);
 	bool SamplePose(double Time, TArray<FTransform>& OutBodies) const;
-	void ApplyPoseInstant(const FGMCGASPRagdollNetPose& Pose);
+	void ApplyPoseInstant(const FGMCMotionRagdollNetPose& Pose);
 
 	FGameplayTag DeadTag;
 	FGameplayTag HealthTag;
@@ -734,10 +827,13 @@ private:
 	double DeathFallbackTime = -1.;
 	bool bCapsuleCollisionUntilDeadTag = false;
 	double LocalRagdollStartTime = 0.;
-	EGMCGASPRagdollPhase LocalPhase = EGMCGASPRagdollPhase::None;
+	EGMCMotionRagdollPhase LocalPhase = EGMCMotionRagdollPhase::None;
 	uint8 LocalSerial = 0;
 	bool bLocalRagdollActive = false;
 	bool bPhysicsControlReady = false;
+	// The mesh's PhysicsTransformUpdateMode before SetupPhysicsControl changed it.
+	bool bSavedPhysicsTransformUpdateMode = false;
+	EPhysicsTransformUpdateMode::Type SavedPhysicsTransformUpdateMode = EPhysicsTransformUpdateMode::SimulationUpatesComponentTransform;
 	bool bInputBound = false;
 
 	// Saved at ragdoll start, restored at the get-up.
@@ -840,6 +936,6 @@ private:
 	float SendAccumulator = 0.f;
 	float SettledFor = 0.f;
 	bool bSettled = false;
-	TArray<FGMCGASPRagdollNetPose> PoseBuffer;
+	TArray<FGMCMotionRagdollNetPose> PoseBuffer;
 	bool bSnapOnNextPose = false;
 };

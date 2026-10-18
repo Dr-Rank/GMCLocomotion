@@ -1,6 +1,9 @@
 // GMCMotion - GMC traversal movement component.
 
 #include "Components/GMCMotion.h"
+#include "Components/GMCMotionControlLoss.h"
+#include "Camera/PlayerCameraManager.h"
+#include "GameFramework/PlayerController.h"
 #include "GMCMotionLog.h"
 #include "Animation/AnimMontage.h"
 #include "Animation/AnimSequence.h"
@@ -244,36 +247,44 @@ bool UGMCMotion::UpdateSlopeSlideMode(const FGMC_FloorParams& Floor)
 {
 	const bool bSliding = GetMovementMode() == SlopeSlideMovementMode;
 
-	const bool bAllowed = bSlopeSlideEnabled
-		&& !Downed
-		&& GetRootCollisionShape() != EGMC_CollisionShape::HorizontalCapsule
-		&& IsAffectedByGravity()
-		&& CurrentImmersionDepth < BuoyantStateMinImmersion;
+	if (!SlopeSlideRequestProperty.IsNone())
+	{
+		const FBoolProperty* Property = FindFProperty<FBoolProperty>(GetClass(), SlopeSlideRequestProperty);
+		bSlopeSlideRequested = Property && Property->GetPropertyValue_InContainer(this);
+	}
 
 	FVector FloorNormal;
 	float FloorAngle = 0.f;
-	const bool bHasFloor = bAllowed && GetSlopeSlideFloor(Floor, bSliding ? SlopeSlideSnapDistance : 0.f, FloorNormal, FloorAngle);
+	const bool bHasFloor = IsSlopeSlideAllowed() && GetSlopeSlideFloor(Floor, bSliding ? SlopeSlideSnapDistance : 0.f, FloorNormal, FloorAngle);
 
 	bool bWantsSlide = false;
+	bool bRequestedEntry = false;
 	if (bHasFloor)
 	{
 		if (bSliding)
 		{
-			// Steep enough, or still running out (see SlopeSlideExitSpeed).
-			bWantsSlide = FloorAngle >= SlopeSlideStopAngle || Velocity.SizeSquared() > FMath::Square(SlopeSlideExitSpeed);
+			// Steep enough, or still running out (see SlopeSlideExitSpeed) - and, for a requested slide, still held.
+			bWantsSlide = ShouldKeepSlopeSlide(bSlopeSlideRequested, bSlopeSlideEndOnRelease && !bSlopeSlideAutoStart,
+				FloorAngle, SlopeSlideStopAngle, Velocity.Size(), SlopeSlideExitSpeed);
 		}
 		else if (IsMovingOnGround())
 		{
-			bWantsSlide = FloorAngle >= SlopeSlideStartAngle && !bReceivedUpwardForce;
+			const bool bAuto = bSlopeSlideAutoStart && FloorAngle >= SlopeSlideStartAngle;
+			bRequestedEntry = ShouldStartRequestedSlopeSlide(bSlopeSlideRequested, true, FloorAngle,
+				SlopeSlideTriggerMinAngle, GetSlopeSlideDownhillSpeed(FloorNormal), SlopeSlideTriggerMinSpeed);
+			bWantsSlide = (bAuto || bRequestedEntry) && !bReceivedUpwardForce;
 		}
-		else if (IsAirborne())
+		else if (IsAirborne() && bSlopeSlideAutoStart)
 		{
 			// Landing on (or falling along) a steep slope, including unwalkable ones GMC would keep the pawn airborne on.
 			bWantsSlide = FloorAngle >= SlopeSlideStartAngle && !bReceivedUpwardForce && Velocity.Z <= 0.;
 		}
 
-		// Entry only: the side of a log or a rock is steep but short, the pawn steps over it.
-		if (bWantsSlide && !bSliding && IsSlopeSlideBump(Floor, FloorNormal))
+		// Entry only: the side of a log or a rock is steep but short, the pawn steps over it. Automatic starts only: the
+		// probe looks SlopeSlideBumpProbeDistance downhill for ground within step height, which on a 20-30 deg ramp is
+		// the ramp itself (18-29 cm lower at 50 cm) - it held a crouch-requested slide off until ~30 deg, measured
+		// 0.8 s / 3.5 m late in CLEAR. A player asking to slide is not stepping over a log.
+		if (bWantsSlide && !bSliding && !bRequestedEntry && IsSlopeSlideBump(Floor, FloorNormal))
 		{
 			bWantsSlide = false;
 		}
@@ -288,9 +299,77 @@ bool UGMCMotion::UpdateSlopeSlideMode(const FGMC_FloorParams& Floor)
 
 	if (!bSliding)
 	{
+		// From the ground, carry the running speed into the slide (see ComputeSlopeSlideEntryVelocity). From the air the
+		// pawn really does lose its speed into the slope, so PhysicsSlopeSlide's projection is left to handle it.
+		if (IsMovingOnGround())
+		{
+			Velocity = ComputeSlopeSlideEntryVelocity(Velocity, FloorNormal);
+		}
 		SetMovementMode(SlopeSlideMovementMode);
 	}
 	return true;
+}
+
+bool UGMCMotion::IsSlopeSlideAllowed() const
+{
+	return bSlopeSlideEnabled
+		&& !Downed
+		&& GetRootCollisionShape() != EGMC_CollisionShape::HorizontalCapsule
+		&& IsAffectedByGravity()
+		&& CurrentImmersionDepth < BuoyantStateMinImmersion;
+}
+
+double UGMCMotion::GetSlopeSlideDownhillSpeed(const FVector& FloorNormal) const
+{
+	const FVector Gravity = GetGravity();
+	const FVector FallLine = (Gravity - (Gravity | FloorNormal) * FloorNormal).GetSafeNormal();
+	return FallLine.IsNearlyZero() ? 0. : (Velocity | FallLine);
+}
+
+void UGMCMotion::SetSlopeSlideRequested(bool bRequested)
+{
+	bSlopeSlideRequested = bRequested;
+}
+
+bool UGMCMotion::CanStartSlopeSlide() const
+{
+	FVector FloorNormal;
+	float FloorAngle = 0.f;
+	if (!IsSlopeSlideAllowed() || !IsMovingOnGround() || !GetSlopeSlideFloor(CurrentFloor, 0.f, FloorNormal, FloorAngle))
+	{
+		return false;
+	}
+	return ShouldStartRequestedSlopeSlide(true, true, FloorAngle, SlopeSlideTriggerMinAngle,
+		GetSlopeSlideDownhillSpeed(FloorNormal), SlopeSlideTriggerMinSpeed);
+}
+
+bool UGMCMotion::ShouldStartRequestedSlopeSlide(bool bRequested, bool bOnGround, float FloorAngle, float MinAngle,
+	double DownhillSpeed, double MinSpeed)
+{
+	return bRequested && bOnGround && FloorAngle >= MinAngle && DownhillSpeed >= MinSpeed;
+}
+
+bool UGMCMotion::ShouldKeepSlopeSlide(bool bRequested, bool bEndOnRelease, float FloorAngle, float StopAngle,
+	double Speed, double ExitSpeed)
+{
+	if (bEndOnRelease && !bRequested)
+	{
+		return false;
+	}
+	return FloorAngle >= StopAngle || Speed > ExitSpeed;
+}
+
+FVector UGMCMotion::ComputeSlopeSlideEntryVelocity(const FVector& GroundVelocity, const FVector& FloorNormal)
+{
+	// Lifting divides by the normal's Z: past ~84 deg that blows up, so project instead (no slide starts there anyway).
+	constexpr double MinNormalZ = 0.1;
+	if (FloorNormal.Z < MinNormalZ)
+	{
+		return GroundVelocity - (GroundVelocity | FloorNormal) * FloorNormal;
+	}
+	FVector Lifted(GroundVelocity.X, GroundVelocity.Y, 0.);
+	Lifted.Z = -(FloorNormal.X * Lifted.X + FloorNormal.Y * Lifted.Y) / FloorNormal.Z;
+	return Lifted;
 }
 
 void UGMCMotion::UpdateSimulatedProxyFloor()
@@ -2150,9 +2229,88 @@ void UGMCMotion::VariableToAnimBPBridge(const FGASPBridgeData& BD)
 	Downed = BD.Downed;
 }
 
+void UGMCMotion::UpdateCameraYawLimit()
+{
+	const APawn* Pawn = Cast<APawn>(GetOwner());
+	APlayerController* PC = Pawn ? Cast<APlayerController>(Pawn->GetController()) : nullptr;
+	APlayerCameraManager* Camera = PC && PC->IsLocalController() ? PC->PlayerCameraManager.Get() : nullptr;
+
+	// Lost the camera (unpossessed, controller changed) while limited: give the old one its values back.
+	if (bCameraYawLimited && LimitedCamera.Get() != Camera)
+	{
+		if (APlayerCameraManager* Old = LimitedCamera.Get())
+		{
+			Old->ViewYawMin = SavedViewYawMin;
+			Old->ViewYawMax = SavedViewYawMax;
+		}
+		bCameraYawLimited = false;
+		bCameraYawLimitHeld = false;
+		LimitedCamera.Reset();
+	}
+	if (!Camera)
+	{
+		return;
+	}
+
+	bool bConditionMet = true;
+	if (!CameraYawLimitConditionProperty.IsNone())
+	{
+		const FBoolProperty* Property = FindFProperty<FBoolProperty>(Pawn->GetClass(), CameraYawLimitConditionProperty);
+		bConditionMet = Property && Property->GetPropertyValue_InContainer(Pawn);
+	}
+
+	float Range = 0.f;
+	bool bControlLost = false;
+	if (bConditionMet && IsSlopeSliding())
+	{
+		Range = SlopeSlideCameraYawRange;
+	}
+	if (bConditionMet && Range <= 0.f && KnockdownCameraYawRange > 0.f)
+	{
+		for (const UActorComponent* Component : Pawn->GetComponents())
+		{
+			const IGMCMotionControlLossSource* Source = Cast<IGMCMotionControlLossSource>(Component);
+			if (Source && Source->IsPlayerControlLost())
+			{
+				Range = KnockdownCameraYawRange;
+				bControlLost = true;
+				break;
+			}
+		}
+	}
+
+	if (Range > 0.f)
+	{
+		if (!bCameraYawLimited)
+		{
+			SavedViewYawMin = Camera->ViewYawMin;
+			SavedViewYawMax = Camera->ViewYawMax;
+			LimitedCamera = Camera;
+		}
+		// The slide re-centres every frame on the facing; a control loss holds the facing it started at.
+		if (!bControlLost || !bCameraYawLimited || !bCameraYawLimitHeld)
+		{
+			CameraYawLimitCentre = GetActorRotation_GMC().Yaw;
+		}
+		bCameraYawLimitHeld = bControlLost;
+		ComputeCameraYawWindow(CameraYawLimitCentre, Range, Camera->ViewYawMin, Camera->ViewYawMax);
+		bCameraYawLimited = true;
+	}
+	else if (bCameraYawLimited)
+	{
+		Camera->ViewYawMin = SavedViewYawMin;
+		Camera->ViewYawMax = SavedViewYawMax;
+		bCameraYawLimited = false;
+		bCameraYawLimitHeld = false;
+		LimitedCamera.Reset();
+	}
+}
+
 void UGMCMotion::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
 {
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+
+	UpdateCameraYawLimit();
 
 	// Clear hand IK when traversal is not active. PreProcessRootMotion sets it to 1
 	// during the FrontLedge window; this clears it during gaps, other windows, and
@@ -2543,7 +2701,17 @@ void UGMCMotion::BindReplicationData_Implementation()
 		EGMC_InterpolationFunction::NearestNeighbour
 	);
 
-	// Ragdoll mode: decided by the server (UGMCGASPRagdollComponent), same contract as Downed.
+	// The slope slide request: originates on the client (a crouch press while sprinting), decides the slide's start and
+	// its release, so it travels with the move.
+	BI_SlopeSlideRequested = BindBool(
+		bSlopeSlideRequested,
+		EGMC_PredictionMode::ClientAuth_Input,
+		EGMC_CombineMode::CombineIfUnchanged,
+		EGMC_SimulationMode::PeriodicAndOnChange_Output,
+		EGMC_InterpolationFunction::NearestNeighbour
+	);
+
+	// Ragdoll mode: decided by the server (UGMCMotionRagdollComponent), same contract as Downed.
 	BI_RagdollMode = BindBool(
 		bRagdollMode,
 		EGMC_PredictionMode::ServerAuth_Output_ClientValidated,

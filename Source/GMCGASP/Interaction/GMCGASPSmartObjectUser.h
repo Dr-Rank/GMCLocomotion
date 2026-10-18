@@ -70,7 +70,7 @@ struct FGMCGASPSmartObjectState
  * start time (the point of the montage's root path, laid out on the slot, closest to the pawn: what GASP58's
  * CHT_SmartObject_BenchAnim angle rows + pose search column do) and replicates the phase. Every machine plays the
  * montage on its AnimInstance; the server and the owner move the capsule along the montage's root path through the
- * GMC ragdoll mode (capsule-follow, widened tolerances), like the character interactions of UGMCGASPRagdollComponent.
+ * GMC ragdoll mode (capsule-follow, widened tolerances), like the character interactions of UGMCMotionRagdollComponent.
  * The pawn's start gap to the path fades out until the root reaches the seat. A move input (server: the GMC input of
  * the moves) or the interact key while seated stands the pawn up; the slot is released at the end of the exit, or at
  * once if the ragdoll takes over (hit, death).

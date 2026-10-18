@@ -1,9 +1,9 @@
 {
 	"FileVersion": 3,
-	"Version": 1,
-	"VersionName": "1.0",
+	"Version": 2,
+	"VersionName": "1.1",
 	"FriendlyName": "GMCMotion",
-	"Description": "Trajectory prediction and traversal movement for GMC pawns. Provides IPoseSearchTrajectoryPredictorInterface implementation and deterministic motion-warped traversal montages.",
+	"Description": "Trajectory prediction and traversal movement for GMC pawns. Provides IPoseSearchTrajectoryPredictorInterface implementation and deterministic motion-warped traversal montages, slope slide, and (GMCMotionRagdoll) networked active ragdoll with get-ups.",
 	"Category": "Gameplay",
 	"CreatedBy": "Execute Games",
 	"EnabledByDefault": true,
@@ -11,6 +11,11 @@
 	"Modules": [
 		{
 			"Name": "GMCMotion",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "GMCMotionRagdoll",
 			"Type": "Runtime",
 			"LoadingPhase": "Default"
 		}
@@ -34,6 +39,10 @@
 		},
 		{
 			"Name": "GMCAbilitySystem",
+			"Enabled": true
+		},
+		{
+			"Name": "PhysicsControl",
 			"Enabled": true
 		}
 	]

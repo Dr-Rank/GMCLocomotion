@@ -1,4 +1,4 @@
-#include "Combat/GMCGASPRagdollComponent.h"
+#include "GMCMotionRagdollComponent.h"
 
 #include "AlphaBlend.h"
 #include "Animation/AnimInstance.h"
@@ -6,7 +6,7 @@
 #include "AnimationRuntime.h"
 #include "Actors/GMCAggregator.h"
 #include "AnimNotifyState_MotionWarping.h"
-#include "Combat/GMCGASPRagdollTriggers.h"
+#include "GMCMotionRagdollTriggers.h"
 #include "UObject/UObjectIterator.h"
 #include "Components/CapsuleComponent.h"
 #include "Components/GMCAbilityComponent.h"
@@ -38,8 +38,9 @@
 #include "RootMotionModifier_SkewWarp.h"
 #include "PhysicsEngine/BodyInstance.h"
 #include "PhysicsEngine/BodySetup.h"
+#include "Misc/PackageName.h"
 
-DEFINE_LOG_CATEGORY_STATIC(LogGMCGASPRagdoll, Log, All);
+DEFINE_LOG_CATEGORY_STATIC(LogGMCMotionRagdoll, Log, All);
 
 // Experiment (branch mesh-tick-order): the physics layer needs the animation evaluated BEFORE physics, in the same frame
 // as the GMC move. GMC's own mesh -> movement component prerequisite orders nothing when the GMC aggregator ticks the
@@ -55,7 +56,7 @@ static TAutoConsoleVariable<int32> CVarRagdollPhysicsLayer(
 	TEXT("DDCVar.CharacterPhysics.DefaultProfile)."));
 
 // Re-applies the switches to every playing ragdoll component when they change.
-struct FGMCGASPRagdollCVars
+struct FGMCMotionRagdollCVars
 {
 	static void Register()
 	{
@@ -70,9 +71,9 @@ struct FGMCGASPRagdollCVars
 	}
 	static void OnChanged(IConsoleVariable*)
 	{
-		for (TObjectIterator<UGMCGASPRagdollComponent> It; It; ++It)
+		for (TObjectIterator<UGMCMotionRagdollComponent> It; It; ++It)
 		{
-			UGMCGASPRagdollComponent* Component = *It;
+			UGMCMotionRagdollComponent* Component = *It;
 			const UWorld* World = Component->GetWorld();
 			if (World && World->IsGameWorld() && Component->HasBegunPlay() && !Component->IsBeingDestroyed())
 			{
@@ -83,19 +84,21 @@ struct FGMCGASPRagdollCVars
 	}
 };
 
-namespace GMCGASPRagdoll
+namespace GMCMotionRagdoll
 {
 	const FName ProfileRagdoll(TEXT("Ragdoll"));
 	const FName ProfileKinematic(TEXT("Kinematic"));
 	const FName ProfilePhysicalAnimation(TEXT("PhysicalAnimation"));
 	const FName SnapshotName(TEXT("RagdollPose"));
-	// BP_GMCMovement.MovementAction (enum MovementAction: None, Ragdoll, GettingUp), read by the ABP.
-	const FName MovementActionProperty(TEXT("MovementAction"));
-	constexpr uint8 ActionNone = 0;
-	constexpr uint8 ActionRagdoll = 1;
-	constexpr uint8 ActionGettingUp = 2;
 	// Per-limb control sets of the Physics Control Asset (head, torso, arms, legs).
 	const FName StrengthSets[4] = {TEXT("ParentSpace_Head"), TEXT("ParentSpace_Torso"), TEXT("ParentSpace_Arms"), TEXT("ParentSpace_Legs")};
+
+	// The default assets (GMCLocomotion's and GASP58's /Game paths) are loaded only where they exist: in another project a
+	// LoadObject of a missing path logs a "failed to find" on every BeginPlay.
+	bool DefaultAssetExists(const TCHAR* ObjectPath)
+	{
+		return FPackageName::DoesPackageExist(FPackageName::ObjectPathToPackageName(FString(ObjectPath)));
+	}
 
 	// Quantization of the streamed bodies.
 	constexpr float OffsetUnit = 0.5f; // cm per step of the int16 offsets to the pelvis (+-163 m)
@@ -239,22 +242,22 @@ namespace GMCGASPRagdoll
 		return false;
 	}
 
-	// GASP58 BP_AnimNotify_TriggerRagdoll in an interaction montage: its time and injury (UGMCGASPAnimNotify_TriggerRagdoll,
+	// GASP58 BP_AnimNotify_TriggerRagdoll in an interaction montage: its time and injury (UGMCMotionAnimNotify_TriggerRagdoll,
 	// or the GASP event's name).
-	bool FindRagdollNotify(const UAnimMontage* Montage, float& OutTime, EGMCGASPRagdollInjury& OutInjury)
+	bool FindRagdollNotify(const UAnimMontage* Montage, float& OutTime, EGMCMotionRagdollInjury& OutInjury)
 	{
-		OutInjury = EGMCGASPRagdollInjury::None;
+		OutInjury = EGMCMotionRagdollInjury::None;
 		if (!Montage)
 		{
 			return false;
 		}
 		for (const FAnimNotifyEvent& Event : Montage->Notifies)
 		{
-			const UGMCGASPAnimNotify_TriggerRagdoll* Notify = Cast<UGMCGASPAnimNotify_TriggerRagdoll>(Event.Notify);
+			const UGMCMotionAnimNotify_TriggerRagdoll* Notify = Cast<UGMCMotionAnimNotify_TriggerRagdoll>(Event.Notify);
 			if (Notify || Event.NotifyName.ToString().Contains(TEXT("TriggerRagdoll")))
 			{
 				OutTime = Event.GetTriggerTime();
-				OutInjury = Notify ? Notify->Injury : EGMCGASPRagdollInjury::None;
+				OutInjury = Notify ? Notify->Injury : EGMCMotionRagdollInjury::None;
 				return true;
 			}
 		}
@@ -263,7 +266,7 @@ namespace GMCGASPRagdoll
 
 	UAnimInstance* GetActorAnimInstance(const AActor* Actor)
 	{
-		const UGMCGASPRagdollComponent* Ragdoll = Actor ? Actor->FindComponentByClass<UGMCGASPRagdollComponent>() : nullptr;
+		const UGMCMotionRagdollComponent* Ragdoll = Actor ? Actor->FindComponentByClass<UGMCMotionRagdollComponent>() : nullptr;
 		TInlineComponentArray<USkeletalMeshComponent*> Meshes(Actor);
 		for (USkeletalMeshComponent* Mesh : Meshes)
 		{
@@ -322,28 +325,28 @@ namespace GMCGASPRagdoll
 	}
 
 	// GASP58 strengths [head, torso, arms, legs] of the on-ground injury poses (ABP "Ragdoll On Ground" Modify Curves).
-	FVector4 InjuryStrengths(EGMCGASPRagdollInjury Injury)
+	FVector4 InjuryStrengths(EGMCMotionRagdollInjury Injury)
 	{
 		switch (Injury)
 		{
-		case EGMCGASPRagdollInjury::Limp:      return FVector4(0.3, 0.3, 0.3, 0.3);
-		case EGMCGASPRagdollInjury::Stunned:   return FVector4(0.2, 1.0, 1.0, 1.0);
-		case EGMCGASPRagdollInjury::Head_Face: return FVector4(1.0, 0.5, 1.0, 0.3);
-		case EGMCGASPRagdollInjury::Head_Back: return FVector4(1.0, 0.5, 2.0, 0.1);
-		case EGMCGASPRagdollInjury::Body_Front:return FVector4(1.0, 1.0, 2.0, 0.2);
-		case EGMCGASPRagdollInjury::Groin:     return FVector4(2.0, 2.0, 2.0, 0.2);
+		case EGMCMotionRagdollInjury::Limp:      return FVector4(0.3, 0.3, 0.3, 0.3);
+		case EGMCMotionRagdollInjury::Stunned:   return FVector4(0.2, 1.0, 1.0, 1.0);
+		case EGMCMotionRagdollInjury::Head_Face: return FVector4(1.0, 0.5, 1.0, 0.3);
+		case EGMCMotionRagdollInjury::Head_Back: return FVector4(1.0, 0.5, 2.0, 0.1);
+		case EGMCMotionRagdollInjury::Body_Front:return FVector4(1.0, 1.0, 2.0, 0.2);
+		case EGMCMotionRagdollInjury::Groin:     return FVector4(2.0, 2.0, 2.0, 0.2);
 		default:                               return FVector4(1.0, 1.0, 1.0, 0.2);
 		}
 	}
 }
 
-using namespace GMCGASPRagdoll;
+using namespace GMCMotionRagdoll;
 
 // =====================================================================================================================
 //  Net pose
 // =====================================================================================================================
 
-bool FGMCGASPRagdollNetPose::NetSerialize(FArchive& Ar, UPackageMap* Map, bool& bOutSuccess)
+bool FGMCMotionRagdollNetPose::NetSerialize(FArchive& Ar, UPackageMap* Map, bool& bOutSuccess)
 {
 	Ar << ServerTime;
 	uint8 Count = (uint8)FMath::Min(Bodies.Num(), 255);
@@ -392,7 +395,7 @@ bool FGMCGASPRagdollNetPose::NetSerialize(FArchive& Ar, UPackageMap* Map, bool& 
 //  Setup
 // =====================================================================================================================
 
-UGMCGASPRagdollComponent::UGMCGASPRagdollComponent()
+UGMCMotionRagdollComponent::UGMCMotionRagdollComponent()
 {
 	PrimaryComponentTick.bCanEverTick = true;
 	PrimaryComponentTick.bStartWithTickEnabled = true;
@@ -401,17 +404,17 @@ UGMCGASPRagdollComponent::UGMCGASPRagdollComponent()
 	SetIsReplicatedByDefault(true);
 }
 
-void UGMCGASPRagdollComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+void UGMCMotionRagdollComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
 {
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
-	DOREPLIFETIME(UGMCGASPRagdollComponent, State);
-	DOREPLIFETIME(UGMCGASPRagdollComponent, FinalPose);
+	DOREPLIFETIME(UGMCMotionRagdollComponent, State);
+	DOREPLIFETIME(UGMCMotionRagdollComponent, FinalPose);
 }
 
-void UGMCGASPRagdollComponent::BeginPlay()
+void UGMCMotionRagdollComponent::BeginPlay()
 {
 	Super::BeginPlay();
-	FGMCGASPRagdollCVars::Register();
+	FGMCMotionRagdollCVars::Register();
 	ConfiguredPhysicsProfile = DefaultPhysicsProfile;
 	ApplyPhysicsLayerSwitch();
 	ApplyMeshTickOrder();
@@ -419,41 +422,44 @@ void UGMCGASPRagdollComponent::BeginPlay()
 	HealthTag = FGameplayTag::RequestGameplayTag(TEXT("Attribute.Health"), false);
 	if (!DeathFallbackEffect)
 	{
-		DeathFallbackEffect = LoadClass<UGMCAbilityEffect>(nullptr, TEXT("/Game/GMC/GMAS/Abilities/Effects/GE_InstantKill.GE_InstantKill_C"));
+		DeathFallbackEffect = DefaultAssetExists(TEXT("/Game/GMC/GMAS/Abilities/Effects/GE_InstantKill.GE_InstantKill_C"))
+			? LoadClass<UGMCAbilityEffect>(nullptr, TEXT("/Game/GMC/GMAS/Abilities/Effects/GE_InstantKill.GE_InstantKill_C")) : nullptr;
 	}
 	// Default get-up databases (GASP58 CHT_GetUpMontages rows, split by its RollingGetup column).
 	if (!GetUpDatabase)
 	{
-		GetUpDatabase = LoadObject<UPoseSearchDatabase>(nullptr, TEXT("/Game/Characters/UE5_Mannequins/Animations/Ragdoll/PSD_GetUp_Stand.PSD_GetUp_Stand"));
+		GetUpDatabase = DefaultAssetExists(TEXT("/Game/Characters/UE5_Mannequins/Animations/Ragdoll/PSD_GetUp_Stand.PSD_GetUp_Stand"))
+			? LoadObject<UPoseSearchDatabase>(nullptr, TEXT("/Game/Characters/UE5_Mannequins/Animations/Ragdoll/PSD_GetUp_Stand.PSD_GetUp_Stand")) : nullptr;
 	}
 	if (!RollingGetUpDatabase)
 	{
-		RollingGetUpDatabase = LoadObject<UPoseSearchDatabase>(nullptr, TEXT("/Game/Characters/UE5_Mannequins/Animations/Ragdoll/PSD_GetUp_Roll.PSD_GetUp_Roll"));
+		RollingGetUpDatabase = DefaultAssetExists(TEXT("/Game/Characters/UE5_Mannequins/Animations/Ragdoll/PSD_GetUp_Roll.PSD_GetUp_Roll"))
+			? LoadObject<UPoseSearchDatabase>(nullptr, TEXT("/Game/Characters/UE5_Mannequins/Animations/Ragdoll/PSD_GetUp_Roll.PSD_GetUp_Roll")) : nullptr;
 	}
-	if (InteractionDatabases.Num() == 0)
+	if (InteractionDatabases.Num() == 0 && bLoadDefaultInteractionDatabases)
 	{
 		// GASP58 CHT_CharacterInteractionPSDs rows: Shove under 200 cm/s, Tackle above; Takedown stand / walk / run.
-		struct FRow { EGMCGASPInteractionType Type; float Min; float Max; const TCHAR* Path; };
+		struct FRow { EGMCMotionInteractionType Type; float Min; float Max; const TCHAR* Path; };
 		const FRow Rows[] = {
-			{EGMCGASPInteractionType::Shove, 0.f, 200.f, TEXT("/Game/Characters/UE5_Mannequins/Animations/Interactions/Shoves/PSD_Interaction_Shove.PSD_Interaction_Shove")},
-			{EGMCGASPInteractionType::Shove, 200.f, 100000.f, TEXT("/Game/Characters/UE5_Mannequins/Animations/Interactions/Tackle/PSD_Interaction_Tackle.PSD_Interaction_Tackle")},
-			{EGMCGASPInteractionType::Takedown, 0.f, 150.f, TEXT("/Game/Characters/UE5_Mannequins/Animations/Interactions/Takedowns/PSD_Interaction_takedown_stand.PSD_Interaction_takedown_stand")},
-			{EGMCGASPInteractionType::Takedown, 150.f, 200.f, TEXT("/Game/Characters/UE5_Mannequins/Animations/Interactions/Takedowns/PSD_Interaction_takedown_Walk.PSD_Interaction_takedown_Walk")},
-			{EGMCGASPInteractionType::Takedown, 200.f, 100000.f, TEXT("/Game/Characters/UE5_Mannequins/Animations/Interactions/Takedowns/PSD_Interaction_takedown_Run.PSD_Interaction_takedown_Run")}};
+			{EGMCMotionInteractionType::Shove, 0.f, 200.f, TEXT("/Game/Characters/UE5_Mannequins/Animations/Interactions/Shoves/PSD_Interaction_Shove.PSD_Interaction_Shove")},
+			{EGMCMotionInteractionType::Shove, 200.f, 100000.f, TEXT("/Game/Characters/UE5_Mannequins/Animations/Interactions/Tackle/PSD_Interaction_Tackle.PSD_Interaction_Tackle")},
+			{EGMCMotionInteractionType::Takedown, 0.f, 150.f, TEXT("/Game/Characters/UE5_Mannequins/Animations/Interactions/Takedowns/PSD_Interaction_takedown_stand.PSD_Interaction_takedown_stand")},
+			{EGMCMotionInteractionType::Takedown, 150.f, 200.f, TEXT("/Game/Characters/UE5_Mannequins/Animations/Interactions/Takedowns/PSD_Interaction_takedown_Walk.PSD_Interaction_takedown_Walk")},
+			{EGMCMotionInteractionType::Takedown, 200.f, 100000.f, TEXT("/Game/Characters/UE5_Mannequins/Animations/Interactions/Takedowns/PSD_Interaction_takedown_Run.PSD_Interaction_takedown_Run")}};
 		for (const FRow& Row : Rows)
 		{
-			FGMCGASPInteractionDatabase& Entry = InteractionDatabases.AddDefaulted_GetRef();
+			FGMCMotionInteractionDatabase& Entry = InteractionDatabases.AddDefaulted_GetRef();
 			Entry.Type = Row.Type;
 			Entry.MinSpeed = Row.Min;
 			Entry.MaxSpeed = Row.Max;
-			Entry.Database = LoadObject<UPoseSearchDatabase>(nullptr, Row.Path);
+			Entry.Database = DefaultAssetExists(Row.Path) ? LoadObject<UPoseSearchDatabase>(nullptr, Row.Path) : nullptr;
 		}
 	}
 #if WITH_EDITOR
 	// In the editor the databases' search index is built on first use, and that first search is skipped (PIE). Started
 	// here instead, so the first get-up / interaction already finds its index.
 	TArray<const UPoseSearchDatabase*> Databases = {GetUpDatabase, RollingGetUpDatabase};
-	for (const FGMCGASPInteractionDatabase& Row : InteractionDatabases)
+	for (const FGMCMotionInteractionDatabase& Row : InteractionDatabases)
 	{
 		Databases.Add(Row.Database);
 	}
@@ -478,23 +484,23 @@ void UGMCGASPRagdollComponent::BeginPlay()
 	}
 	if (UGMC_AbilitySystemComponent* Abilities = GetAbilities())
 	{
-		Abilities->OnActiveTagsChanged.AddUniqueDynamic(this, &UGMCGASPRagdollComponent::OnActiveTagsChanged);
-		Abilities->OnEffectApplied.AddUniqueDynamic(this, &UGMCGASPRagdollComponent::OnEffectApplied);
+		Abilities->OnActiveTagsChanged.AddUniqueDynamic(this, &UGMCMotionRagdollComponent::OnActiveTagsChanged);
+		Abilities->OnEffectApplied.AddUniqueDynamic(this, &UGMCMotionRagdollComponent::OnEffectApplied);
 	}
 	BindInput();
 }
 
-void UGMCGASPRagdollComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
+void UGMCMotionRagdollComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
 	if (UGMC_AbilitySystemComponent* Abilities = GetAbilities())
 	{
-		Abilities->OnActiveTagsChanged.RemoveDynamic(this, &UGMCGASPRagdollComponent::OnActiveTagsChanged);
-		Abilities->OnEffectApplied.RemoveDynamic(this, &UGMCGASPRagdollComponent::OnEffectApplied);
+		Abilities->OnActiveTagsChanged.RemoveDynamic(this, &UGMCMotionRagdollComponent::OnActiveTagsChanged);
+		Abilities->OnEffectApplied.RemoveDynamic(this, &UGMCMotionRagdollComponent::OnEffectApplied);
 	}
 	Super::EndPlay(EndPlayReason);
 }
 
-USkeletalMeshComponent* UGMCGASPRagdollComponent::GetMesh() const
+USkeletalMeshComponent* UGMCMotionRagdollComponent::GetMesh() const
 {
 	TInlineComponentArray<USkeletalMeshComponent*> Meshes(GetOwner());
 	for (USkeletalMeshComponent* Candidate : Meshes)
@@ -507,38 +513,45 @@ USkeletalMeshComponent* UGMCGASPRagdollComponent::GetMesh() const
 	return nullptr;
 }
 
-UGMCMotion* UGMCGASPRagdollComponent::GetMotion() const
+UGMCMotion* UGMCMotionRagdollComponent::GetMotion() const
 {
 	return GetOwner() ? GetOwner()->FindComponentByClass<UGMCMotion>() : nullptr;
 }
 
-UGMC_AbilitySystemComponent* UGMCGASPRagdollComponent::GetAbilities() const
+UGMC_AbilitySystemComponent* UGMCMotionRagdollComponent::GetAbilities() const
 {
 	return GetOwner() ? GetOwner()->FindComponentByClass<UGMC_AbilitySystemComponent>() : nullptr;
 }
 
-bool UGMCGASPRagdollComponent::IsLocallyControlledPawn() const
+bool UGMCMotionRagdollComponent::IsLocallyControlledPawn() const
 {
 	const APawn* Pawn = Cast<APawn>(GetOwner());
 	return Pawn && Pawn->IsLocallyControlled();
 }
 
-double UGMCGASPRagdollComponent::GetServerTime() const
+double UGMCMotionRagdollComponent::GetServerTime() const
 {
 	const AGameStateBase* GameState = GetWorld() ? GetWorld()->GetGameState() : nullptr;
 	return GameState ? GameState->GetServerWorldTimeSeconds() : (GetWorld() ? GetWorld()->GetTimeSeconds() : 0.);
 }
 
-void UGMCGASPRagdollComponent::SetupPhysicsControl()
+void UGMCMotionRagdollComponent::SetupPhysicsControl()
 {
 	USkeletalMeshComponent* Mesh = GetMesh();
-	if (bPhysicsControlReady || !Mesh || !PhysicsControlAsset)
+	// No bodies (a standing mesh without collision) = nothing to control yet; EnterRagdollLocal calls this again once the
+	// Ragdoll profile has made them.
+	if (bPhysicsControlReady || !Mesh || !PhysicsControlAsset || Mesh->Bodies.Num() == 0)
 	{
 		return;
 	}
 	// GASP58's mesh: the component never follows its simulated bodies (default mode SimulationUpatesComponentTransform
 	// drags it with the root body, and with it the controls' animation targets: the physics layer runs away). It stays on
 	// the capsule, and the capsule follows the pelvis.
+	if (!bSavedPhysicsTransformUpdateMode)
+	{
+		bSavedPhysicsTransformUpdateMode = true;
+		SavedPhysicsTransformUpdateMode = Mesh->PhysicsTransformUpdateMode;
+	}
 	Mesh->PhysicsTransformUpdateMode = EPhysicsTransformUpdateMode::ComponentTransformIsKinematic;
 	if (!PhysicsControl)
 	{
@@ -551,11 +564,68 @@ void UGMCGASPRagdollComponent::SetupPhysicsControl()
 	bPhysicsControlReady = PhysicsControl->CreateControlsAndBodyModifiersFromPhysicsControlAsset(Mesh, nullptr, NAME_None);
 	if (!bPhysicsControlReady)
 	{
-		UE_LOG(LogGMCGASPRagdoll, Warning, TEXT("%s: CreateControlsAndBodyModifiersFromPhysicsControlAsset failed"), *GetNameSafe(GetOwner()));
+		UE_LOG(LogGMCMotionRagdoll, Warning, TEXT("%s: CreateControlsAndBodyModifiersFromPhysicsControlAsset failed"), *GetNameSafe(GetOwner()));
 	}
 }
 
-void UGMCGASPRagdollComponent::BindInput()
+void UGMCMotionRagdollComponent::ReleasePhysicsControl()
+{
+	if (PhysicsControl)
+	{
+		PhysicsControl->DestroyComponent();
+		PhysicsControl = nullptr;
+	}
+	bPhysicsControlReady = false;
+	AppliedPhysicsProfile = NAME_None;
+	USkeletalMeshComponent* Mesh = GetMesh();
+	if (Mesh && bSavedPhysicsTransformUpdateMode)
+	{
+		Mesh->PhysicsTransformUpdateMode = SavedPhysicsTransformUpdateMode;
+		bSavedPhysicsTransformUpdateMode = false;
+	}
+}
+
+void UGMCMotionRagdollComponent::RebindHeldItemsToHand()
+{
+	USkeletalMeshComponent* Mesh = GetMesh();
+	if (!Mesh || HeldItemSockets.Num() == 0 || Mesh->GetBoneIndex(HeldItemHandBone) == INDEX_NONE)
+	{
+		return;
+	}
+	for (USceneComponent* Child : TArray<USceneComponent*>(Mesh->GetAttachChildren()))
+	{
+		if (!Child || !HeldItemSockets.Contains(Child->GetAttachSocketName()))
+		{
+			continue;
+		}
+		if (ReboundHeldItems.ContainsByPredicate([Child](const FReboundHeldItem& R) { return R.Component.Get() == Child; }))
+		{
+			continue;
+		}
+		ReboundHeldItems.Add({Child, Child->GetAttachSocketName(), Child->GetRelativeTransform()});
+		Child->AttachToComponent(Mesh, FAttachmentTransformRules::KeepWorldTransform, HeldItemHandBone);
+	}
+}
+
+void UGMCMotionRagdollComponent::RestoreHeldItems()
+{
+	USkeletalMeshComponent* Mesh = GetMesh();
+	for (const FReboundHeldItem& Item : ReboundHeldItems)
+	{
+		USceneComponent* Child = Item.Component.Get();
+		// Skipped if something else moved it meanwhile (unequipped, dropped, swapped).
+		if (!Child || !Mesh || Child->GetAttachParent() != Mesh || Child->GetAttachSocketName() != HeldItemHandBone)
+		{
+			continue;
+		}
+		Child->AttachToComponent(Mesh, FAttachmentTransformRules::KeepRelativeTransform, Item.Socket);
+		Child->SetRelativeTransform(Item.Relative);
+	}
+	ReboundHeldItems.Reset();
+	HeldItemsGetUpMontage.Reset();
+}
+
+void UGMCMotionRagdollComponent::BindInput()
 {
 	if (bInputBound || !IsLocallyControlledPawn())
 	{
@@ -569,19 +639,19 @@ void UGMCGASPRagdollComponent::BindInput()
 	}
 	if (ToggleRagdollAction)
 	{
-		Input->BindAction(ToggleRagdollAction, ETriggerEvent::Started, this, &UGMCGASPRagdollComponent::OnToggleRagdollInput);
+		Input->BindAction(ToggleRagdollAction, ETriggerEvent::Started, this, &UGMCMotionRagdollComponent::OnToggleRagdollInput);
 	}
 	if (GetUpAction)
 	{
-		Input->BindAction(GetUpAction, ETriggerEvent::Started, this, &UGMCGASPRagdollComponent::OnGetUpInput);
+		Input->BindAction(GetUpAction, ETriggerEvent::Started, this, &UGMCMotionRagdollComponent::OnGetUpInput);
 	}
 	if (ShoveAction)
 	{
-		Input->BindAction(ShoveAction, ETriggerEvent::Started, this, &UGMCGASPRagdollComponent::OnShoveInput);
+		Input->BindAction(ShoveAction, ETriggerEvent::Started, this, &UGMCMotionRagdollComponent::OnShoveInput);
 	}
 	if (TakedownAction)
 	{
-		Input->BindAction(TakedownAction, ETriggerEvent::Started, this, &UGMCGASPRagdollComponent::OnTakedownInput);
+		Input->BindAction(TakedownAction, ETriggerEvent::Started, this, &UGMCMotionRagdollComponent::OnTakedownInput);
 	}
 	bInputBound = true;
 }
@@ -590,14 +660,14 @@ void UGMCGASPRagdollComponent::BindInput()
 //  Requests (server decides)
 // =====================================================================================================================
 
-void UGMCGASPRagdollComponent::OnToggleRagdollInput()
+void UGMCMotionRagdollComponent::OnToggleRagdollInput()
 {
 	RequestToggleRagdoll();
 }
 
-void UGMCGASPRagdollComponent::OnGetUpInput()
+void UGMCMotionRagdollComponent::OnGetUpInput()
 {
-	if (State.Phase != EGMCGASPRagdollPhase::Ragdoll)
+	if (State.Phase != EGMCMotionRagdollPhase::Ragdoll)
 	{
 		return;
 	}
@@ -611,52 +681,52 @@ void UGMCGASPRagdollComponent::OnGetUpInput()
 	}
 }
 
-void UGMCGASPRagdollComponent::RequestToggleRagdoll()
+void UGMCMotionRagdollComponent::RequestToggleRagdoll()
 {
 	if (!GetOwner()->HasAuthority())
 	{
 		ServerRequestToggleRagdoll();
 		return;
 	}
-	if (State.Phase == EGMCGASPRagdollPhase::None)
+	if (State.Phase == EGMCMotionRagdollPhase::None)
 	{
-		TriggerRagdoll(EGMCGASPRagdollInjury::None, FVector::ZeroVector, FVector::ZeroVector);
+		TriggerRagdoll(EGMCMotionRagdollInjury::None, FVector::ZeroVector, FVector::ZeroVector);
 	}
-	else if (State.Phase == EGMCGASPRagdollPhase::Ragdoll)
+	else if (State.Phase == EGMCMotionRagdollPhase::Ragdoll)
 	{
 		ExitRagdoll(false);
 	}
 }
 
-void UGMCGASPRagdollComponent::ServerRequestToggleRagdoll_Implementation()
+void UGMCMotionRagdollComponent::ServerRequestToggleRagdoll_Implementation()
 {
 	RequestToggleRagdoll();
 }
 
-void UGMCGASPRagdollComponent::ServerRequestGetUp_Implementation()
+void UGMCMotionRagdollComponent::ServerRequestGetUp_Implementation()
 {
 	ExitRagdoll(false);
 }
 
-void UGMCGASPRagdollComponent::TriggerRagdoll(EGMCGASPRagdollInjury Injury, FVector Impulse, FVector ImpulseLocation)
+void UGMCMotionRagdollComponent::TriggerRagdoll(EGMCMotionRagdollInjury Injury, FVector Impulse, FVector ImpulseLocation)
 {
 	// From an interaction too: GASP's TriggerRagdoll notify of the shove / tackle / takedown montages.
-	if (!GetOwner()->HasAuthority() || (State.Phase != EGMCGASPRagdollPhase::None && State.Phase != EGMCGASPRagdollPhase::Interacting))
+	if (!GetOwner()->HasAuthority() || (State.Phase != EGMCMotionRagdollPhase::None && State.Phase != EGMCMotionRagdollPhase::Interacting))
 	{
 		return;
 	}
-	const EGMCGASPRagdollPhase Old = State.Phase;
+	const EGMCMotionRagdollPhase Old = State.Phase;
 	InteractionRagdollTime = -1.f;
 	State.InteractionAsset = nullptr;
 	State.Partner = nullptr;
 	State.bWarp = false;
-	State.Phase = EGMCGASPRagdollPhase::Ragdoll;
+	State.Phase = EGMCMotionRagdollPhase::Ragdoll;
 	State.Injury = Injury;
 	State.Impulse = Impulse;
 	State.ImpulseLocation = ImpulseLocation;
 	State.Montage = nullptr;
 	++State.Serial;
-	FinalPose = FGMCGASPRagdollNetPose();
+	FinalPose = FGMCMotionRagdollNetPose();
 
 	if (UGMCMotion* Motion = GetMotion())
 	{
@@ -673,9 +743,9 @@ void UGMCGASPRagdollComponent::TriggerRagdoll(EGMCGASPRagdollInjury Injury, FVec
 	ApplyPhase(State.Phase, Old);
 }
 
-void UGMCGASPRagdollComponent::ExitRagdoll(bool bForce)
+void UGMCMotionRagdollComponent::ExitRagdoll(bool bForce)
 {
-	if (!GetOwner()->HasAuthority() || State.Phase != EGMCGASPRagdollPhase::Ragdoll)
+	if (!GetOwner()->HasAuthority() || State.Phase != EGMCMotionRagdollPhase::Ragdoll)
 	{
 		return;
 	}
@@ -683,8 +753,8 @@ void UGMCGASPRagdollComponent::ExitRagdoll(bool bForce)
 	{
 		return;
 	}
-	const EGMCGASPRagdollPhase Old = State.Phase;
-	State.Phase = EGMCGASPRagdollPhase::GettingUp;
+	const EGMCMotionRagdollPhase Old = State.Phase;
+	State.Phase = EGMCMotionRagdollPhase::GettingUp;
 	float StartTime = 0.f;
 	const double T0 = FPlatformTime::Seconds();
 	State.Montage = PickGetUpMontage(StartTime);
@@ -693,14 +763,14 @@ void UGMCGASPRagdollComponent::ExitRagdoll(bool bForce)
 	++State.Serial;
 	GetUpTimeLeft = State.Montage ? FMath::Max(0.2f, State.Montage->GetPlayLength() - StartTime - State.Montage->GetDefaultBlendOutTime()) : 0.2f;
 	ApplyPhase(State.Phase, Old);
-	UE_CLOG(bDebug, LogGMCGASPRagdoll, Log, TEXT("%s get-up cost: pick %.2f ms, apply phase (exit local, montage) %.2f ms"),
+	UE_CLOG(bDebug, LogGMCMotionRagdoll, Log, TEXT("%s get-up cost: pick %.2f ms, apply phase (exit local, montage) %.2f ms"),
 		*GetNameSafe(GetOwner()), (T1 - T0) * 1000., (FPlatformTime::Seconds() - T1) * 1000.);
 }
 
-void UGMCGASPRagdollComponent::AddHitImpulse(FVector ImpactVelocity, FVector ImpactLocation, float ImpartedEnergy)
+void UGMCMotionRagdollComponent::AddHitImpulse(FVector ImpactVelocity, FVector ImpactLocation, float ImpartedEnergy)
 {
 	USkeletalMeshComponent* Mesh = GetMesh();
-	if (GetOwner()->HasAuthority() && State.Phase == EGMCGASPRagdollPhase::None && Mesh)
+	if (GetOwner()->HasAuthority() && State.Phase == EGMCMotionRagdollPhase::None && Mesh)
 	{
 		if (!TryHitKnockdown(ImpactVelocity, ImpactLocation, ImpartedEnergy) && HitReactionImpulse > 0.f && !ImpactVelocity.IsNearlyZero())
 		{
@@ -711,7 +781,7 @@ void UGMCGASPRagdollComponent::AddHitImpulse(FVector ImpactVelocity, FVector Imp
 		}
 		return;
 	}
-	if (!GetOwner()->HasAuthority() || State.Phase != EGMCGASPRagdollPhase::Ragdoll || !Mesh || ImpactVelocity.IsNearlyZero())
+	if (!GetOwner()->HasAuthority() || State.Phase != EGMCMotionRagdollPhase::Ragdoll || !Mesh || ImpactVelocity.IsNearlyZero())
 	{
 		return;
 	}
@@ -722,7 +792,7 @@ void UGMCGASPRagdollComponent::AddHitImpulse(FVector ImpactVelocity, FVector Imp
 	Mesh->AddImpulseAtLocation(Direction.GetSafeNormal() * HitImpulseStrength, ImpactLocation, Bone);
 }
 
-bool UGMCGASPRagdollComponent::TryHitKnockdown(const FVector& ImpactVelocity, const FVector& ImpactLocation, float ImpartedEnergy)
+bool UGMCMotionRagdollComponent::TryHitKnockdown(const FVector& ImpactVelocity, const FVector& ImpactLocation, float ImpartedEnergy)
 {
 	if (KnockdownThreshold <= 0.f || ImpartedEnergy <= 0.f)
 	{
@@ -759,7 +829,7 @@ bool UGMCGASPRagdollComponent::TryHitKnockdown(const FVector& ImpactVelocity, co
 	const bool bFall = KnockdownScore >= KnockdownThreshold;
 	if (bDebug)
 	{
-		UE_LOG(LogGMCGASPRagdoll, Log, TEXT("%s knockdown: %s (%s) %.0f J at %.0f cm/s -> +%.0f, score %.0f / %.0f%s"), *GetNameSafe(GetOwner()),
+		UE_LOG(LogGMCMotionRagdoll, Log, TEXT("%s knockdown: %s (%s) %.0f J at %.0f cm/s -> +%.0f, score %.0f / %.0f%s"), *GetNameSafe(GetOwner()),
 			*HitBone.ToString(), *Bone.ToString(), ImpartedEnergy, Speed, Added, KnockdownScore, KnockdownThreshold, bFall ? TEXT(" -> FALL") : TEXT(""));
 	}
 	if (!bFall)
@@ -774,15 +844,15 @@ bool UGMCGASPRagdollComponent::TryHitKnockdown(const FVector& ImpactVelocity, co
 	return true;
 }
 
-void UGMCGASPRagdollComponent::UpdateRagdollCamera(float DeltaTime)
+void UGMCMotionRagdollComponent::UpdateRagdollCamera(float DeltaTime)
 {
 	static const FName ShoulderOffsetName(TEXT("ShoulderOffset"));
 	static const FName ArmLengthName(TEXT("ArmLength"));
 	static const FName VerticalOffsetName(TEXT("VerticalOffset"));
 	USkeletalMeshComponent* Mesh = GetMesh();
 	const bool bWanted = bRagdollCamera && Mesh && IsLocallyControlledPawn()
-		&& (bLocalRagdollActive || LocalPhase == EGMCGASPRagdollPhase::Ragdoll || LocalPhase == EGMCGASPRagdollPhase::GettingUp
-			|| LocalPhase == EGMCGASPRagdollPhase::Dead);
+		&& (bLocalRagdollActive || LocalPhase == EGMCMotionRagdollPhase::Ragdoll || LocalPhase == EGMCMotionRagdollPhase::GettingUp
+			|| LocalPhase == EGMCMotionRagdollPhase::Dead);
 	if (bWanted && !bRagdollCameraActive)
 	{
 		USceneComponent* Rig = nullptr;
@@ -811,7 +881,7 @@ void UGMCGASPRagdollComponent::UpdateRagdollCamera(float DeltaTime)
 		bRagdollCameraActive = true;
 	}
 	// First person back once the get-up is over (switched to third person by EnterRagdollLocal).
-	if (!bWanted && bSavedFirstPersonView && !bLocalRagdollActive && LocalPhase == EGMCGASPRagdollPhase::None && IsLocallyControlledPawn())
+	if (!bWanted && bSavedFirstPersonView && !bLocalRagdollActive && LocalPhase == EGMCMotionRagdollPhase::None && IsLocallyControlledPawn())
 	{
 		SetViewModeForRagdoll(false);
 	}
@@ -840,7 +910,7 @@ void UGMCGASPRagdollComponent::UpdateRagdollCamera(float DeltaTime)
 	}
 }
 
-void UGMCGASPRagdollComponent::SetMeshAttachmentsIgnoreCamera(bool bIgnore)
+void UGMCMotionRagdollComponent::SetMeshAttachmentsIgnoreCamera(bool bIgnore)
 {
 	if (!bIgnore)
 	{
@@ -885,7 +955,7 @@ void UGMCGASPRagdollComponent::SetMeshAttachmentsIgnoreCamera(bool bIgnore)
 	}
 }
 
-void UGMCGASPRagdollComponent::CacheBodyMotion(float DeltaTime)
+void UGMCMotionRagdollComponent::CacheBodyMotion(float DeltaTime)
 {
 	USkeletalMeshComponent* Mesh = GetMesh();
 	if (!Mesh || DeltaTime <= UE_KINDA_SMALL_NUMBER)
@@ -915,7 +985,7 @@ void UGMCGASPRagdollComponent::CacheBodyMotion(float DeltaTime)
 	++MotionSamples;
 }
 
-void UGMCGASPRagdollComponent::ApplyInheritedBodyVelocities()
+void UGMCMotionRagdollComponent::ApplyInheritedBodyVelocities()
 {
 	USkeletalMeshComponent* Mesh = GetMesh();
 	const int32 Samples = MotionSamples;
@@ -938,16 +1008,16 @@ void UGMCGASPRagdollComponent::ApplyInheritedBodyVelocities()
 	}
 }
 
-void UGMCGASPRagdollComponent::MulticastHitReaction_Implementation(FName Bone, FVector_NetQuantize10 Impulse, FVector_NetQuantize Location)
+void UGMCMotionRagdollComponent::MulticastHitReaction_Implementation(FName Bone, FVector_NetQuantize10 Impulse, FVector_NetQuantize Location)
 {
 	StartHitReaction(Bone, Impulse, Location);
 }
 
-void UGMCGASPRagdollComponent::StartHitReaction(FName Bone, const FVector& Impulse, const FVector& Location)
+void UGMCMotionRagdollComponent::StartHitReaction(FName Bone, const FVector& Impulse, const FVector& Location)
 {
-	using namespace GMCGASPRagdoll;
+	using namespace GMCMotionRagdoll;
 	USkeletalMeshComponent* Mesh = GetMesh();
-	if (!Mesh || !PhysicsControl || !bPhysicsControlReady || bLocalRagdollActive || LocalPhase != EGMCGASPRagdollPhase::None)
+	if (!Mesh || !PhysicsControl || !bPhysicsControlReady || bLocalRagdollActive || LocalPhase != EGMCMotionRagdollPhase::None)
 	{
 		return;
 	}
@@ -1006,12 +1076,12 @@ void UGMCGASPRagdollComponent::StartHitReaction(FName Bone, const FVector& Impul
 	PendingHitLocation = Location;
 }
 
-void UGMCGASPRagdollComponent::UpdateHitReaction(float DeltaTime)
+void UGMCMotionRagdollComponent::UpdateHitReaction(float DeltaTime)
 {
 	if (HitReactionLimbs.Num() == 0)
 	{
-		if (bHitReactionCollision && !bLocalRagdollActive && LocalPhase == EGMCGASPRagdollPhase::None
-			&& AppliedPhysicsProfile == GMCGASPRagdoll::ProfileKinematic)
+		if (bHitReactionCollision && !bLocalRagdollActive && LocalPhase == EGMCMotionRagdollPhase::None
+			&& AppliedPhysicsProfile == GMCMotionRagdoll::ProfileKinematic)
 		{
 			bHitReactionCollision = false;
 			RestorePhysicalCollision();
@@ -1019,7 +1089,7 @@ void UGMCGASPRagdollComponent::UpdateHitReaction(float DeltaTime)
 		return;
 	}
 	USkeletalMeshComponent* Mesh = GetMesh();
-	if (!Mesh || !PhysicsControl || bLocalRagdollActive || LocalPhase != EGMCGASPRagdollPhase::None)
+	if (!Mesh || !PhysicsControl || bLocalRagdollActive || LocalPhase != EGMCMotionRagdollPhase::None)
 	{
 		// The ragdoll or a montage took over (its profile replaces the reaction's modifiers and controls).
 		HitReactionLimbs.Reset();
@@ -1046,7 +1116,7 @@ void UGMCGASPRagdollComponent::UpdateHitReaction(float DeltaTime)
 	}
 }
 
-void UGMCGASPRagdollComponent::ApplyMeshTickOrder()
+void UGMCMotionRagdollComponent::ApplyMeshTickOrder()
 {
 	USkeletalMeshComponent* Mesh = GetMesh();
 	if (!Mesh)
@@ -1080,9 +1150,9 @@ void UGMCGASPRagdollComponent::ApplyMeshTickOrder()
 	bMeshTickChained = bWanted;
 }
 
-void UGMCGASPRagdollComponent::ApplyPhysicsLayerSwitch()
+void UGMCMotionRagdollComponent::ApplyPhysicsLayerSwitch()
 {
-	using namespace GMCGASPRagdoll;
+	using namespace GMCMotionRagdoll;
 	switch (CVarRagdollPhysicsLayer.GetValueOnGameThread())
 	{
 	case 0: DefaultPhysicsProfile = ProfileKinematic; break;
@@ -1090,7 +1160,7 @@ void UGMCGASPRagdollComponent::ApplyPhysicsLayerSwitch()
 	default: DefaultPhysicsProfile = ConfiguredPhysicsProfile; break;
 	}
 	// Standing pawns switch now; the others take it at their get-up (ApplyDefaultPhysicsProfile).
-	if (!bPhysicsControlReady || bLocalRagdollActive || LocalPhase != EGMCGASPRagdollPhase::None || AppliedPhysicsProfile == DefaultPhysicsProfile)
+	if (!bPhysicsControlReady || bLocalRagdollActive || LocalPhase != EGMCMotionRagdollPhase::None || AppliedPhysicsProfile == DefaultPhysicsProfile)
 	{
 		return;
 	}
@@ -1105,7 +1175,13 @@ void UGMCGASPRagdollComponent::ApplyPhysicsLayerSwitch()
 	ApplyDefaultPhysicsProfile();
 }
 
-void UGMCGASPRagdollComponent::OnActiveTagsChanged(FGameplayTagContainer AddedTags, FGameplayTagContainer RemovedTags)
+bool UGMCMotionRagdollComponent::IsDeathRagdollActive(const AActor* Actor)
+{
+	const UGMCMotionRagdollComponent* Ragdoll = Actor ? Actor->FindComponentByClass<UGMCMotionRagdollComponent>() : nullptr;
+	return Ragdoll && Ragdoll->IsRagdolling();
+}
+
+void UGMCMotionRagdollComponent::OnActiveTagsChanged(FGameplayTagContainer AddedTags, FGameplayTagContainer RemovedTags)
 {
 	if (!DeadTag.IsValid() || !AddedTags.HasTagExact(DeadTag))
 	{
@@ -1126,20 +1202,20 @@ void UGMCGASPRagdollComponent::OnActiveTagsChanged(FGameplayTagContainer AddedTa
 	{
 		ServerEnterDeath();
 	}
-	else if (LocalPhase != EGMCGASPRagdollPhase::Dead)
+	else if (LocalPhase != EGMCMotionRagdollPhase::Dead)
 	{
-		ApplyPhase(EGMCGASPRagdollPhase::Dead, LocalPhase);
+		ApplyPhase(EGMCMotionRagdollPhase::Dead, LocalPhase);
 	}
 }
 
-void UGMCGASPRagdollComponent::ServerEnterDeath()
+void UGMCMotionRagdollComponent::ServerEnterDeath()
 {
-	const EGMCGASPRagdollPhase Old = State.Phase;
-	if (Old == EGMCGASPRagdollPhase::Dead)
+	const EGMCMotionRagdollPhase Old = State.Phase;
+	if (Old == EGMCMotionRagdollPhase::Dead)
 	{
 		return;
 	}
-	State.Phase = EGMCGASPRagdollPhase::Dead;
+	State.Phase = EGMCMotionRagdollPhase::Dead;
 	++State.Serial;
 	if (UGMCMotion* Motion = GetMotion())
 	{
@@ -1149,7 +1225,7 @@ void UGMCGASPRagdollComponent::ServerEnterDeath()
 	ApplyPhase(State.Phase, Old);
 }
 
-void UGMCGASPRagdollComponent::RunOwnerDeathHandling()
+void UGMCMotionRagdollComponent::RunOwnerDeathHandling()
 {
 	// Same BP path as the State.Dead tag (BP_GMC_Pawn.HandleDeath: end abilities, drop the weapon, death kick, FP mesh);
 	// its bIsDead guard makes the later tag call a no-op. After EnterRagdollLocal: the inherited body velocities would
@@ -1175,19 +1251,19 @@ void UGMCGASPRagdollComponent::RunOwnerDeathHandling()
 	}
 }
 
-void UGMCGASPRagdollComponent::RegisterPendingDamage(AActor* Target, float HealthDelta)
+void UGMCMotionRagdollComponent::RegisterPendingDamage(AActor* Target, float HealthDelta)
 {
 	if (!Target || !Target->HasAuthority())
 	{
 		return;
 	}
-	if (UGMCGASPRagdollComponent* Ragdoll = Target->FindComponentByClass<UGMCGASPRagdollComponent>())
+	if (UGMCMotionRagdollComponent* Ragdoll = Target->FindComponentByClass<UGMCMotionRagdollComponent>())
 	{
 		Ragdoll->AddPendingDamage(HealthDelta);
 	}
 }
 
-void UGMCGASPRagdollComponent::AddPendingDamage(float HealthDelta)
+void UGMCMotionRagdollComponent::AddPendingDamage(float HealthDelta)
 {
 	UGMC_AbilitySystemComponent* Abilities = GetAbilities();
 	if (!bEarlyServerDeath || !Abilities || !HealthTag.IsValid() || HealthDelta >= 0.f || IsDead())
@@ -1203,22 +1279,22 @@ void UGMCGASPRagdollComponent::AddPendingDamage(float HealthDelta)
 	{
 		Health += P.Delta;
 	}
-	// Also with "log LogGMCGASPRagdoll Verbose".
-	if (bDebug || UE_LOG_ACTIVE(LogGMCGASPRagdoll, Verbose))
+	// Also with "log LogGMCMotionRagdoll Verbose".
+	if (bDebug || UE_LOG_ACTIVE(LogGMCMotionRagdoll, Verbose))
 	{
-		UE_LOG(LogGMCGASPRagdoll, Log, TEXT("%s pending damage %.1f: health %.1f -> %.1f with %d in flight"),
+		UE_LOG(LogGMCMotionRagdoll, Log, TEXT("%s pending damage %.1f: health %.1f -> %.1f with %d in flight"),
 			*GetNameSafe(GetOwner()), HealthDelta, Current, Health, PendingDamage.Num());
 	}
 	if (Health <= 0.f && !(DeadTag.IsValid() && Abilities->HasActiveTag(DeadTag)))
 	{
-		UE_LOG(LogGMCGASPRagdoll, Log, TEXT("%s: early server death (health %.1f, %.1f in flight)"),
+		UE_LOG(LogGMCMotionRagdoll, Log, TEXT("%s: early server death (health %.1f, %.1f in flight)"),
 			*GetNameSafe(GetOwner()), Current, Health - Current);
 		DeathFallbackTime = Now + DeathFallbackDelay;
 		ServerEnterDeath();
 	}
 }
 
-void UGMCGASPRagdollComponent::OnEffectApplied(UGMCAbilityEffect* AppliedEffect)
+void UGMCMotionRagdollComponent::OnEffectApplied(UGMCAbilityEffect* AppliedEffect)
 {
 	if (!AppliedEffect || !GetOwner()->HasAuthority() || PendingDamage.Num() == 0)
 	{
@@ -1255,7 +1331,7 @@ void UGMCGASPRagdollComponent::OnEffectApplied(UGMCAbilityEffect* AppliedEffect)
 	}
 }
 
-void UGMCGASPRagdollComponent::OnRep_State()
+void UGMCMotionRagdollComponent::OnRep_State()
 {
 	if (State.Serial == LocalSerial && State.Phase == LocalPhase)
 	{
@@ -1268,7 +1344,7 @@ void UGMCGASPRagdollComponent::OnRep_State()
 	}
 }
 
-void UGMCGASPRagdollComponent::UpdateMeshUpdateRate()
+void UGMCMotionRagdollComponent::UpdateMeshUpdateRate()
 {
 	USkeletalMeshComponent* Mesh = GetMesh();
 	if (!Mesh)
@@ -1282,8 +1358,8 @@ void UGMCGASPRagdollComponent::UpdateMeshUpdateRate()
 	//   then two still frames on a shoved bot ("it lags, like a correction");
 	// - physics layer: the physics blend overwrites the interpolated frames, the animation ran as a 3-frame sawtooth and
 	//   the simulated feet vibrated ~1.3 cm per frame.
-	const bool bFullRate = LocalPhase != EGMCGASPRagdollPhase::None || bLocalRagdollActive
-		|| AppliedPhysicsProfile == GMCGASPRagdoll::ProfilePhysicalAnimation;
+	const bool bFullRate = LocalPhase != EGMCMotionRagdollPhase::None || bLocalRagdollActive
+		|| AppliedPhysicsProfile == GMCMotionRagdoll::ProfilePhysicalAnimation;
 	if (bFullRate && !bUROOverridden)
 	{
 		bSavedURO = Mesh->bEnableUpdateRateOptimizations;
@@ -1297,43 +1373,43 @@ void UGMCGASPRagdollComponent::UpdateMeshUpdateRate()
 	}
 }
 
-void UGMCGASPRagdollComponent::ApplyPhase(EGMCGASPRagdollPhase NewPhase, EGMCGASPRagdollPhase OldPhase)
+void UGMCMotionRagdollComponent::ApplyPhase(EGMCMotionRagdollPhase NewPhase, EGMCMotionRagdollPhase OldPhase)
 {
 	LocalPhase = NewPhase;
 	LocalSerial = State.Serial;
 	UpdateMeshUpdateRate();
 	if (bDebug)
 	{
-		UE_LOG(LogGMCGASPRagdoll, Log, TEXT("%s [%s] phase %d -> %d"), *GetNameSafe(GetOwner()),
+		UE_LOG(LogGMCMotionRagdoll, Log, TEXT("%s [%s] phase %d -> %d"), *GetNameSafe(GetOwner()),
 			GetOwner()->HasAuthority() ? TEXT("server") : TEXT("client"), (int32)OldPhase, (int32)NewPhase);
 	}
-	if (OldPhase == EGMCGASPRagdollPhase::Interacting && NewPhase != EGMCGASPRagdollPhase::Interacting)
+	if (OldPhase == EGMCMotionRagdollPhase::Interacting && NewPhase != EGMCMotionRagdollPhase::Interacting)
 	{
 		ExitInteractionLocal();
 	}
 	switch (NewPhase)
 	{
-	case EGMCGASPRagdollPhase::Ragdoll:
+	case EGMCMotionRagdollPhase::Ragdoll:
 		EnterRagdollLocal(false);
 		break;
-	case EGMCGASPRagdollPhase::Dead:
+	case EGMCMotionRagdollPhase::Dead:
 		EnterRagdollLocal(true);
 		RunOwnerDeathHandling();
 		break;
-	case EGMCGASPRagdollPhase::GettingUp:
+	case EGMCMotionRagdollPhase::GettingUp:
 		if (bLocalRagdollActive)
 		{
 			ExitRagdollLocal();
 		}
 		break;
-	case EGMCGASPRagdollPhase::None:
+	case EGMCMotionRagdollPhase::None:
 		if (bLocalRagdollActive)
 		{
 			ExitRagdollLocal();
 		}
 		FinishGetUp();
 		break;
-	case EGMCGASPRagdollPhase::Interacting:
+	case EGMCMotionRagdollPhase::Interacting:
 		EnterInteractionLocal();
 		break;
 	}
@@ -1343,7 +1419,7 @@ void UGMCGASPRagdollComponent::ApplyPhase(EGMCGASPRagdollPhase NewPhase, EGMCGAS
 //  Enter / exit (every machine)
 // =====================================================================================================================
 
-void UGMCGASPRagdollComponent::EnterRagdollLocal(bool bDead)
+void UGMCMotionRagdollComponent::EnterRagdollLocal(bool bDead)
 {
 	USkeletalMeshComponent* Mesh = GetMesh();
 	UGMCMotion* Motion = GetMotion();
@@ -1367,11 +1443,14 @@ void UGMCGASPRagdollComponent::EnterRagdollLocal(bool bDead)
 		}
 		return;
 	}
+	// Before anything moves, while the mesh still holds the held pose (the offsets kept are the held ones).
+	if (!bDead)
+	{
+		RebindHeldItemsToHand();
+	}
 	bLocalRagdollActive = true;
 	LocalRagdollStartTime = GetWorld()->GetTimeSeconds();
 	bDefaultProfilePending = false;
-	SetupPhysicsControl();
-	SpineBody = ResolveBodyBone(SpineBone);
 
 	if (UAnimInstance* AnimInstance = Mesh->GetAnimInstance())
 	{
@@ -1419,6 +1498,9 @@ void UGMCGASPRagdollComponent::EnterRagdollLocal(bool bDead)
 	SavedMeshObjectType = Mesh->GetCollisionObjectType();
 	SavedMeshCollisionEnabled = Mesh->GetCollisionEnabled();
 	Mesh->SetCollisionProfileName(RagdollCollisionProfile);
+	// After the Ragdoll profile, which creates the bodies of a mesh standing without collision.
+	SetupPhysicsControl();
+	SpineBody = ResolveBodyBone(SpineBone);
 	if (UCapsuleComponent* Capsule = Cast<UCapsuleComponent>(GetOwner()->GetRootComponent()))
 	{
 		SavedCapsulePawnResponse = Capsule->GetCollisionResponseToChannel(ECC_Pawn);
@@ -1453,7 +1535,7 @@ void UGMCGASPRagdollComponent::EnterRagdollLocal(bool bDead)
 		Mesh->AddImpulseAtLocation(State.Impulse, State.ImpulseLocation, Bone);
 	}
 
-	SetMovementAction(ActionRagdoll);
+	SetMovementAction(MovementActionRagdollValue);
 	bHasLastCom = false;
 	ComVelocity = FVector::ZeroVector;
 	AutoRollForce = FVector::ZeroVector;
@@ -1468,7 +1550,7 @@ void UGMCGASPRagdollComponent::EnterRagdollLocal(bool bDead)
 	Strengths = bDead ? FVector4(0., 0., 0., 0.) : FVector4(1., 1., 1., 1.);
 }
 
-void UGMCGASPRagdollComponent::ExitRagdollLocal()
+void UGMCMotionRagdollComponent::ExitRagdollLocal()
 {
 	USkeletalMeshComponent* Mesh = GetMesh();
 	UGMCMotion* Motion = GetMotion();
@@ -1490,7 +1572,11 @@ void UGMCGASPRagdollComponent::ExitRagdollLocal()
 	// GASP58 get-up step 4: the bodies stay simulated. The controls would read one frame of huge bone velocities while
 	// the anim graph jumps to the snapshot: no target velocities on the parent space controls this frame, then the
 	// default profile next frame (ApplyDefaultPhysicsProfile from the tick).
-	if (PhysicsControl && bPhysicsControlReady)
+	// Kept simulated only if the restored collision keeps the bodies; without collision they are destroyed below
+	// and the controls with them, so the ABP's snapshot blend (MovementAction, 0.5 s) carries the get-up alone.
+	const bool bBodiesSurviveExit = SavedMeshCollisionEnabled == ECollisionEnabled::PhysicsOnly
+		|| SavedMeshCollisionEnabled == ECollisionEnabled::QueryAndPhysics;
+	if (PhysicsControl && bPhysicsControlReady && bBodiesSurviveExit)
 	{
 		FPhysicsControlData NoVelocity;
 		NoVelocity.LinearTargetVelocityMultiplier = 0.f;
@@ -1501,6 +1587,7 @@ void UGMCGASPRagdollComponent::ExitRagdollLocal()
 	else
 	{
 		Mesh->SetSimulatePhysics(false);
+		ReleasePhysicsControl();
 	}
 	// Back on the capsule; the snapshot's root is moved so the body stays where it lay. No teleport: the simulated bodies
 	// stay where they are, the controls pull them onto the animation.
@@ -1519,7 +1606,7 @@ void UGMCGASPRagdollComponent::ExitRagdollLocal()
 		{
 			RootBody->SetInstanceSimulatePhysics(true, false, true);
 		}
-		UE_CLOG(Mesh->GetAttachParent() != Parent, LogGMCGASPRagdoll, Warning, TEXT("%s: ragdoll mesh not re-attached"), *GetOwner()->GetName());
+		UE_CLOG(Mesh->GetAttachParent() != Parent, LogGMCMotionRagdoll, Warning, TEXT("%s: ragdoll mesh not re-attached"), *GetOwner()->GetName());
 	}
 	Mesh->SetRelativeTransform(SavedMeshRelative, false, nullptr, ETeleportType::None);
 	if (Snapshot && Snapshot->bIsValid && Snapshot->LocalTransforms.Num() > 0)
@@ -1544,7 +1631,8 @@ void UGMCGASPRagdollComponent::ExitRagdollLocal()
 	// First person comes back once standing (UpdateRagdollCamera), not here: restored at the start of the get-up the view
 	// cut from the ragdoll camera onto the head, which then rode the whole get-up (jolt at the start, user 2026-09-30).
 
-	SetMovementAction(ActionGettingUp);
+	SetMovementAction(MovementActionGettingUpValue);
+	HeldItemsGetUpMontage = State.Montage;
 	if (AnimInstance && State.Montage)
 	{
 		// Full weight at once: the ABP already fades from the ragdoll snapshot into the default branch (Blend Poses
@@ -1559,21 +1647,24 @@ void UGMCGASPRagdollComponent::ExitRagdollLocal()
 	PoseBuffer.Reset();
 }
 
-void UGMCGASPRagdollComponent::FinishGetUp()
+void UGMCMotionRagdollComponent::FinishGetUp()
 {
-	SetMovementAction(ActionNone);
+	SetMovementAction(MovementActionNoneValue);
 	if (UGMCMotion* Motion = GetMotion())
 	{
 		Motion->ClearRagdollCapsuleTarget();
 	}
 }
 
-void UGMCGASPRagdollComponent::SetMovementAction(uint8 Action)
+void UGMCMotionRagdollComponent::SetMovementAction(uint8 Action)
 {
-	SetByte(GetMotion(), MovementActionProperty, Action);
+	if (!MovementActionProperty.IsNone())
+	{
+		SetByte(GetMotion(), MovementActionProperty, Action);
+	}
 }
 
-void UGMCGASPRagdollComponent::SetViewModeForRagdoll(bool bRagdoll)
+void UGMCMotionRagdollComponent::SetViewModeForRagdoll(bool bRagdoll)
 {
 	// First person spins with the head: third person while ragdolling (GASP uses a far camera).
 	AActor* Owner = GetOwner();
@@ -1600,7 +1691,7 @@ void UGMCGASPRagdollComponent::SetViewModeForRagdoll(bool bRagdoll)
 //  Tick
 // =====================================================================================================================
 
-void UGMCGASPRagdollComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
+void UGMCMotionRagdollComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
 {
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 	BindInput();
@@ -1631,7 +1722,7 @@ void UGMCGASPRagdollComponent::TickComponent(float DeltaTime, ELevelTick TickTyp
 		const float Health = Abilities && HealthTag.IsValid() ? Abilities->GetAttributeValueByTag(HealthTag) : 0.f;
 		if (Abilities && DeathFallbackEffect && Health > 0.f && !(DeadTag.IsValid() && Abilities->HasActiveTag(DeadTag)))
 		{
-			UE_LOG(LogGMCGASPRagdoll, Warning, TEXT("%s: early death but Health %.2f (%d damage still in flight), applying %s"),
+			UE_LOG(LogGMCMotionRagdoll, Warning, TEXT("%s: early death but Health %.2f (%d damage still in flight), applying %s"),
 				*GetNameSafe(GetOwner()), Health, PendingDamage.Num(), *GetNameSafe(DeathFallbackEffect));
 			bool bSuccess = false;
 			int32 Handle = -1, Id = -1;
@@ -1651,13 +1742,13 @@ void UGMCGASPRagdollComponent::TickComponent(float DeltaTime, ELevelTick TickTyp
 	}
 
 	const bool bServer = GetOwner()->HasAuthority();
-	if (bServer && State.Phase == EGMCGASPRagdollPhase::GettingUp)
+	if (bServer && State.Phase == EGMCMotionRagdollPhase::GettingUp)
 	{
 		GetUpTimeLeft -= DeltaTime;
 		if (GetUpTimeLeft <= 0.f)
 		{
-			const EGMCGASPRagdollPhase Old = State.Phase;
-			State.Phase = EGMCGASPRagdollPhase::None;
+			const EGMCMotionRagdollPhase Old = State.Phase;
+			State.Phase = EGMCMotionRagdollPhase::None;
 			State.Montage = nullptr;
 			++State.Serial;
 			if (UGMCMotion* Motion = GetMotion())
@@ -1672,19 +1763,19 @@ void UGMCGASPRagdollComponent::TickComponent(float DeltaTime, ELevelTick TickTyp
 		}
 	}
 
-	if (LocalPhase == EGMCGASPRagdollPhase::GettingUp)
+	if (LocalPhase == EGMCMotionRagdollPhase::GettingUp)
 	{
 		UpdateMontageCapsule();
 	}
-	if (LocalPhase == EGMCGASPRagdollPhase::Interacting)
+	if (LocalPhase == EGMCMotionRagdollPhase::Interacting)
 	{
 		UpdateInteractionMotion();
 		UpdateInteractionConstraints(DeltaTime);
 	}
 	UpdateInteractionIKBlendOut(DeltaTime);
-	if (bServer && State.Phase == EGMCGASPRagdollPhase::Interacting)
+	if (bServer && State.Phase == EGMCMotionRagdollPhase::Interacting)
 	{
-		// The montage's TriggerRagdoll notify hands the pawn to the ragdoll (UGMCGASPAnimNotify_TriggerRagdoll fires on the
+		// The montage's TriggerRagdoll notify hands the pawn to the ragdoll (UGMCMotionAnimNotify_TriggerRagdoll fires on the
 		// server). Same moment from the montage time when the notify can't fire (GASP event without its class, or a
 		// notify in the blend-out): a victim never leaves Interacting standing.
 		const UAnimInstance* AnimInstance = GetMesh() ? GetMesh()->GetAnimInstance() : nullptr;
@@ -1694,7 +1785,7 @@ void UGMCGASPRagdollComponent::TickComponent(float DeltaTime, ELevelTick TickTyp
 		if (InteractionRagdollTime >= 0.f && Position >= InteractionRagdollTime)
 		{
 			float Time = 0.f;
-			EGMCGASPRagdollInjury Injury = EGMCGASPRagdollInjury::None;
+			EGMCMotionRagdollInjury Injury = EGMCMotionRagdollInjury::None;
 			FindRagdollNotify(State.Montage, Time, Injury);
 			TriggerRagdoll(Injury, FVector::ZeroVector, FVector::ZeroVector);
 		}
@@ -1703,9 +1794,20 @@ void UGMCGASPRagdollComponent::TickComponent(float DeltaTime, ELevelTick TickTyp
 			FinishInteraction();
 		}
 	}
-	if (bServer && State.Phase == EGMCGASPRagdollPhase::None && bTraceForObstacles)
+	if (bServer && State.Phase == EGMCMotionRagdollPhase::None && bTraceForObstacles)
 	{
 		TraceForObstacles();
+	}
+	// Held items go back to their socket once standing and the get-up montage has fully blended out (until then the
+	// socket's bone follows the montage, not the held pose; riding the hand with the held offset is the seamless part).
+	if (ReboundHeldItems.Num() > 0 && LocalPhase == EGMCMotionRagdollPhase::None)
+	{
+		const UAnimInstance* AnimInstance = GetMesh() ? GetMesh()->GetAnimInstance() : nullptr;
+		const UAnimMontage* GetUp = HeldItemsGetUpMontage.Get();
+		if (!AnimInstance || !GetUp || !AnimInstance->Montage_IsPlaying(GetUp))
+		{
+			RestoreHeldItems();
+		}
 	}
 	if (!bLocalRagdollActive)
 	{
@@ -1729,7 +1831,7 @@ void UGMCGASPRagdollComponent::TickComponent(float DeltaTime, ELevelTick TickTyp
 	SpineVelocity = Mesh->GetPhysicsLinearVelocity(SpineBody);
 	RagdollSpeed = SpineVelocity.Size();
 
-	const bool bDead = LocalPhase == EGMCGASPRagdollPhase::Dead;
+	const bool bDead = LocalPhase == EGMCMotionRagdollPhase::Dead;
 	if (bServer)
 	{
 		if (!bDead)
@@ -1761,7 +1863,7 @@ void UGMCGASPRagdollComponent::TickComponent(float DeltaTime, ELevelTick TickTyp
 //  Server behaviours (GASP58 Ragdoll_UpdateBehaviors)
 // =====================================================================================================================
 
-void UGMCGASPRagdollComponent::TraceForObstacles()
+void UGMCMotionRagdollComponent::TraceForObstacles()
 {
 	const USkeletalMeshComponent* Mesh = GetMesh();
 	if (!Mesh)
@@ -1777,11 +1879,11 @@ void UGMCGASPRagdollComponent::TraceForObstacles()
 	if (GetWorld()->SweepSingleByObjectType(Hit, Start, End, FQuat::Identity, Objects, FCollisionShape::MakeSphere(ObstacleTraceRadius), Params))
 	{
 		// No kick: the obstacle itself pushes the simulated bodies (GASP does the same).
-		TriggerRagdoll(EGMCGASPRagdollInjury::None, FVector::ZeroVector, FVector::ZeroVector);
+		TriggerRagdoll(EGMCMotionRagdollInjury::None, FVector::ZeroVector, FVector::ZeroVector);
 	}
 }
 
-FName UGMCGASPRagdollComponent::ResolveBodyBone(FName Bone) const
+FName UGMCMotionRagdollComponent::ResolveBodyBone(FName Bone) const
 {
 	const USkeletalMeshComponent* Mesh = GetMesh();
 	FName Current = Bone;
@@ -1796,7 +1898,7 @@ FName UGMCGASPRagdollComponent::ResolveBodyBone(FName Bone) const
 	return PelvisBone;
 }
 
-bool UGMCGASPRagdollComponent::FindFloor(FVector& OutLocation, FVector& OutNormal)
+bool UGMCMotionRagdollComponent::FindFloor(FVector& OutLocation, FVector& OutNormal)
 {
 	const USkeletalMeshComponent* Mesh = GetMesh();
 	if (!Mesh)
@@ -1817,7 +1919,7 @@ bool UGMCGASPRagdollComponent::FindFloor(FVector& OutLocation, FVector& OutNorma
 	return bHit;
 }
 
-FTransform UGMCGASPRagdollComponent::GetRagdollTraceTransform() const
+FTransform UGMCMotionRagdollComponent::GetRagdollTraceTransform() const
 {
 	USkeletalMeshComponent* Mesh = GetMesh();
 	if (!Mesh)
@@ -1846,7 +1948,7 @@ FTransform UGMCGASPRagdollComponent::GetRagdollTraceTransform() const
 	return TraceFrameRelativeToSpine * Mesh->GetSocketTransform(TraceBone);
 }
 
-void UGMCGASPRagdollComponent::UpdateBehaviours(float DeltaTime)
+void UGMCMotionRagdollComponent::UpdateBehaviours(float DeltaTime)
 {
 	USkeletalMeshComponent* Mesh = GetMesh();
 
@@ -1891,9 +1993,10 @@ void UGMCGASPRagdollComponent::UpdateBehaviours(float DeltaTime)
 		PhysicsControl->SetBodyModifiersInSetGravityMultiplier(TEXT("All"), Gravity);
 	}
 
-	// Bots get up once still (NPC_GetupCheck); players ask (GetUpAction).
+	// Bots get up once still (NPC_GetupCheck); players ask (GetUpAction), or get up the same way
+	// (bPlayersGetUpAutomatically).
 	const APawn* Pawn = Cast<APawn>(GetOwner());
-	if (Pawn && !Pawn->IsPlayerControlled())
+	if (Pawn && (!Pawn->IsPlayerControlled() || bPlayersGetUpAutomatically))
 	{
 		StillTime = RagdollSpeed <= BotGetUpSpeed ? StillTime + DeltaTime : 0.f;
 		if (StillTime >= BotGetUpDelay)
@@ -1904,10 +2007,15 @@ void UGMCGASPRagdollComponent::UpdateBehaviours(float DeltaTime)
 		{
 			ExitRagdoll(false);
 		}
+		// The deadline (ExitRagdoll returns at once if the exit above already happened).
+		if (BotForceGetUpDelay > 0.f && RagdollTime >= BotForceGetUpDelay)
+		{
+			ExitRagdoll(true);
+		}
 	}
 }
 
-void UGMCGASPRagdollComponent::UpdateStrengths(float DeltaTime)
+void UGMCMotionRagdollComponent::UpdateStrengths(float DeltaTime)
 {
 	if (!PhysicsControl || !bPhysicsControlReady)
 	{
@@ -1915,7 +2023,7 @@ void UGMCGASPRagdollComponent::UpdateStrengths(float DeltaTime)
 	}
 	// GASP58 drives these from the ragdoll anim graph's curves; same values, picked from the same state here.
 	FVector4 Target(0., 0., 0., 0.);
-	if (LocalPhase == EGMCGASPRagdollPhase::Ragdoll)
+	if (LocalPhase == EGMCMotionRagdollPhase::Ragdoll)
 	{
 		const bool bOnGround = bHasFloor && TimeToImpact < 0.25f;
 		if (!bOnGround)
@@ -1938,7 +2046,7 @@ void UGMCGASPRagdollComponent::UpdateStrengths(float DeltaTime)
 	}
 }
 
-UAnimMontage* UGMCGASPRagdollComponent::PickGetUpMontage(float& OutStartTime)
+UAnimMontage* UGMCMotionRagdollComponent::PickGetUpMontage(float& OutStartTime)
 {
 	OutStartTime = 0.f;
 	USkeletalMeshComponent* Mesh = GetMesh();
@@ -1972,7 +2080,7 @@ UAnimMontage* UGMCGASPRagdollComponent::PickGetUpMontage(float& OutStartTime)
 		FPoseSearchBlueprintResult Result;
 		UPoseSearchLibrary::MotionMatch(AnimInstance, TArray<UObject*>{Database}, PoseHistoryName, FPoseSearchContinuingProperties(),
 			FPoseSearchFutureProperties(), Result);
-		UE_CLOG(bDebug, LogGMCGASPRagdoll, Log, TEXT("%s get-up search cost: history override %.2f ms, motion match %.2f ms"),
+		UE_CLOG(bDebug, LogGMCMotionRagdoll, Log, TEXT("%s get-up search cost: history override %.2f ms, motion match %.2f ms"),
 			*GetNameSafe(GetOwner()), (S1 - S0) * 1000., (FPlatformTime::Seconds() - S1) * 1000.);
 		if (UAnimMontage* Selected = Cast<UAnimMontage>(Result.SelectedAnim.Get()))
 		{
@@ -1982,18 +2090,18 @@ UAnimMontage* UGMCGASPRagdollComponent::PickGetUpMontage(float& OutStartTime)
 			const bool bStandGetUp = Selected == GetUpFaceUp || Selected == GetUpFaceDown;
 			if (!bRolling && bStandGetUp && OrientationMontage && Selected != OrientationMontage)
 			{
-				UE_LOG(LogGMCGASPRagdoll, Log, TEXT("%s get-up: search picked %s (cost %.2f) but the chest faces %s: %s"),
+				UE_LOG(LogGMCMotionRagdoll, Log, TEXT("%s get-up: search picked %s (cost %.2f) but the chest faces %s: %s"),
 					*GetNameSafe(GetOwner()), *Selected->GetName(), Result.SearchCost, bFaceUp ? TEXT("up") : TEXT("down"), *OrientationMontage->GetName());
 				Selected = OrientationMontage;
 			}
 			else if (bDebug)
 			{
-				UE_LOG(LogGMCGASPRagdoll, Log, TEXT("%s get-up: %s at %.2f s (cost %.2f, rolling %d)"), *GetNameSafe(GetOwner()),
+				UE_LOG(LogGMCMotionRagdoll, Log, TEXT("%s get-up: %s at %.2f s (cost %.2f, rolling %d)"), *GetNameSafe(GetOwner()),
 					*Selected->GetName(), Result.SelectedTime, Result.SearchCost, bRolling);
 			}
 			return Selected;
 		}
-		UE_LOG(LogGMCGASPRagdoll, Warning, TEXT("%s get-up: the pose search found nothing in %s, face up/down fallback"),
+		UE_LOG(LogGMCMotionRagdoll, Warning, TEXT("%s get-up: the pose search found nothing in %s, face up/down fallback"),
 			*GetNameSafe(GetOwner()), *GetNameSafe(Database));
 	}
 	if (bRolling && GetUpRollLeft && GetUpRollRight)
@@ -2003,7 +2111,7 @@ UAnimMontage* UGMCGASPRagdollComponent::PickGetUpMontage(float& OutStartTime)
 	}
 	if (bDebug)
 	{
-		UE_LOG(LogGMCGASPRagdoll, Log, TEXT("%s get-up: chest Z %.2f -> %s"), *GetNameSafe(GetOwner()), ChestWorld.Z, bFaceUp ? TEXT("face up") : TEXT("face down"));
+		UE_LOG(LogGMCMotionRagdoll, Log, TEXT("%s get-up: chest Z %.2f -> %s"), *GetNameSafe(GetOwner()), ChestWorld.Z, bFaceUp ? TEXT("face up") : TEXT("face down"));
 	}
 	return OrientationMontage;
 }
@@ -2012,7 +2120,7 @@ UAnimMontage* UGMCGASPRagdollComponent::PickGetUpMontage(float& OutStartTime)
 //  Capsule (GASP58 Get_RagdollTransform / Get_RagdollTargetOrientation / BP_MovementMode_Ragdoll)
 // =====================================================================================================================
 
-void UGMCGASPRagdollComponent::UpdateCapsuleTarget(float DeltaTime)
+void UGMCMotionRagdollComponent::UpdateCapsuleTarget(float DeltaTime)
 {
 	USkeletalMeshComponent* Mesh = GetMesh();
 	UGMCMotion* Motion = GetMotion();
@@ -2041,10 +2149,10 @@ void UGMCGASPRagdollComponent::UpdateCapsuleTarget(float DeltaTime)
 	{
 		Location.Z = FloorLocation.Z + Motion->GetRootCollisionHalfHeight(true) + 2.f;
 	}
-	Motion->SetRagdollCapsuleTarget(FTransform(FRotator(0., Facing.Yaw, 0.), Location), LocalPhase != EGMCGASPRagdollPhase::Ragdoll);
+	Motion->SetRagdollCapsuleTarget(FTransform(FRotator(0., Facing.Yaw, 0.), Location), LocalPhase != EGMCMotionRagdollPhase::Ragdoll);
 }
 
-void UGMCGASPRagdollComponent::UpdateMontageCapsule()
+void UGMCMotionRagdollComponent::UpdateMontageCapsule()
 {
 	USkeletalMeshComponent* Mesh = GetMesh();
 	UGMCMotion* Motion = GetMotion();
@@ -2062,7 +2170,7 @@ void UGMCGASPRagdollComponent::UpdateMontageCapsule()
 	Motion->SetRagdollCapsuleTarget(FTransform(Rotation, GetUpStartActor.GetLocation() + Offset), false);
 }
 
-void UGMCGASPRagdollComponent::PushAnimValues()
+void UGMCMotionRagdollComponent::PushAnimValues()
 {
 	USkeletalMeshComponent* Mesh = GetMesh();
 	UAnimInstance* AnimInstance = Mesh ? Mesh->GetAnimInstance() : nullptr;
@@ -2082,7 +2190,7 @@ void UGMCGASPRagdollComponent::PushAnimValues()
 //  Pose streaming
 // =====================================================================================================================
 
-bool UGMCGASPRagdollComponent::CapturePose(FGMCGASPRagdollNetPose& OutPose) const
+bool UGMCMotionRagdollComponent::CapturePose(FGMCMotionRagdollNetPose& OutPose) const
 {
 	const USkeletalMeshComponent* Mesh = GetMesh();
 	if (!Mesh || Mesh->Bodies.Num() == 0)
@@ -2104,14 +2212,34 @@ bool UGMCGASPRagdollComponent::CapturePose(FGMCGASPRagdollNetPose& OutPose) cons
 	return true;
 }
 
-void UGMCGASPRagdollComponent::ServerStreamPose(float DeltaTime)
+void UGMCMotionRagdollComponent::ServerStreamPose(float DeltaTime)
 {
 	if (bSettled)
 	{
+		// Keep FinalPose honest while the corpse creeps under SettleSpeed.
+		FinalPoseRecheckTimer += DeltaTime;
+		if (FinalPoseRecheckTimer >= FinalPoseRecheckInterval)
+		{
+			FinalPoseRecheckTimer = 0.f;
+			FGMCMotionRagdollNetPose Now;
+			if (CapturePose(Now) && Now.Bodies.Num() == FinalPose.Bodies.Num())
+			{
+				double Worst = 0.;
+				for (int32 i = 0; i < Now.Bodies.Num(); ++i)
+				{
+					Worst = FMath::Max(Worst, FVector::Dist(Now.Bodies[i].GetLocation(), FinalPose.Bodies[i].GetLocation()));
+				}
+				if (Worst > FinalPoseTolerance)
+				{
+					FinalPose = Now;
+					GetOwner()->ForceNetUpdate();
+				}
+			}
+		}
 		return;
 	}
 	USkeletalMeshComponent* Mesh = GetMesh();
-	if (LocalPhase == EGMCGASPRagdollPhase::Dead)
+	if (LocalPhase == EGMCMotionRagdollPhase::Dead)
 	{
 		float MaxSpeed = 0.f;
 		for (const FBodyInstance* Body : Mesh->Bodies)
@@ -2135,14 +2263,14 @@ void UGMCGASPRagdollComponent::ServerStreamPose(float DeltaTime)
 		return;
 	}
 	SendAccumulator = 0.f;
-	FGMCGASPRagdollNetPose Pose;
+	FGMCMotionRagdollNetPose Pose;
 	if (CapturePose(Pose))
 	{
 		MulticastPose(Pose);
 	}
 }
 
-void UGMCGASPRagdollComponent::MulticastPose_Implementation(const FGMCGASPRagdollNetPose& Pose)
+void UGMCMotionRagdollComponent::MulticastPose_Implementation(const FGMCMotionRagdollNetPose& Pose)
 {
 	if (GetOwner()->HasAuthority() || !bLocalRagdollActive)
 	{
@@ -2160,7 +2288,7 @@ void UGMCGASPRagdollComponent::MulticastPose_Implementation(const FGMCGASPRagdol
 	}
 }
 
-void UGMCGASPRagdollComponent::OnRep_FinalPose()
+void UGMCMotionRagdollComponent::OnRep_FinalPose()
 {
 	if (GetOwner()->HasAuthority() || FinalPose.Bodies.Num() == 0)
 	{
@@ -2175,13 +2303,13 @@ void UGMCGASPRagdollComponent::OnRep_FinalPose()
 	{
 		ApplyPoseInstant(FinalPose);
 		PoseBuffer.Reset();
-		FGMCGASPRagdollNetPose Held = FinalPose;
+		FGMCMotionRagdollNetPose Held = FinalPose;
 		Held.ServerTime = GetServerTime() + 3600.;
 		PoseBuffer.Add(Held);
 	}
 }
 
-bool UGMCGASPRagdollComponent::SamplePose(double Time, TArray<FTransform>& OutBodies) const
+bool UGMCMotionRagdollComponent::SamplePose(double Time, TArray<FTransform>& OutBodies) const
 {
 	if (PoseBuffer.Num() == 0)
 	{
@@ -2197,8 +2325,8 @@ bool UGMCGASPRagdollComponent::SamplePose(double Time, TArray<FTransform>& OutBo
 		OutBodies = PoseBuffer[Next == 0 ? 0 : PoseBuffer.Num() - 1].Bodies;
 		return true;
 	}
-	const FGMCGASPRagdollNetPose& A = PoseBuffer[Next - 1];
-	const FGMCGASPRagdollNetPose& B = PoseBuffer[Next];
+	const FGMCMotionRagdollNetPose& A = PoseBuffer[Next - 1];
+	const FGMCMotionRagdollNetPose& B = PoseBuffer[Next];
 	const float Alpha = (float)FMath::Clamp((Time - A.ServerTime) / FMath::Max(B.ServerTime - A.ServerTime, 0.001), 0., 1.);
 	OutBodies.SetNum(FMath::Min(A.Bodies.Num(), B.Bodies.Num()));
 	for (int32 i = 0; i < OutBodies.Num(); ++i)
@@ -2210,7 +2338,7 @@ bool UGMCGASPRagdollComponent::SamplePose(double Time, TArray<FTransform>& OutBo
 	return true;
 }
 
-void UGMCGASPRagdollComponent::ApplyPoseInstant(const FGMCGASPRagdollNetPose& Pose)
+void UGMCMotionRagdollComponent::ApplyPoseInstant(const FGMCMotionRagdollNetPose& Pose)
 {
 	USkeletalMeshComponent* Mesh = GetMesh();
 	if (!Mesh)
@@ -2228,7 +2356,7 @@ void UGMCGASPRagdollComponent::ApplyPoseInstant(const FGMCGASPRagdollNetPose& Po
 	}
 }
 
-void UGMCGASPRagdollComponent::ClientFollowPose(float DeltaTime)
+void UGMCMotionRagdollComponent::ClientFollowPose(float DeltaTime)
 {
 	USkeletalMeshComponent* Mesh = GetMesh();
 	if (!Mesh || PoseBuffer.Num() == 0 || DeltaTime <= UE_KINDA_SMALL_NUMBER)
@@ -2306,7 +2434,7 @@ void UGMCGASPRagdollComponent::ClientFollowPose(float DeltaTime)
 	if (bDebug && DebugTimer >= 1.f)
 	{
 		DebugTimer = 0.f;
-		UE_LOG(LogGMCGASPRagdoll, Log, TEXT("%s [client] poses %d buffer %d lag %.3f s, bodies %d/%d, mean error %.1f cm, snaps %d"),
+		UE_LOG(LogGMCMotionRagdoll, Log, TEXT("%s [client] poses %d buffer %d lag %.3f s, bodies %d/%d, mean error %.1f cm, snaps %d"),
 			*GetNameSafe(GetOwner()), DebugPosesReceived, PoseBuffer.Num(), GetServerTime() - PoseBuffer.Last().ServerTime,
 			Steered, Count, Steered ? ErrorSum / Steered : 0., Snaps);
 	}
@@ -2316,13 +2444,13 @@ void UGMCGASPRagdollComponent::ClientFollowPose(float DeltaTime)
 //  Physics profiles (GASP58 SetPhysicsProfile)
 // =====================================================================================================================
 
-bool UGMCGASPRagdollComponent::IsActorRagdolling(const AActor* Actor)
+bool UGMCMotionRagdollComponent::IsActorRagdolling(const AActor* Actor)
 {
-	const UGMCGASPRagdollComponent* Ragdoll = Actor ? Actor->FindComponentByClass<UGMCGASPRagdollComponent>() : nullptr;
+	const UGMCMotionRagdollComponent* Ragdoll = Actor ? Actor->FindComponentByClass<UGMCMotionRagdollComponent>() : nullptr;
 	return Ragdoll && Ragdoll->bLocalRagdollActive;
 }
 
-void UGMCGASPRagdollComponent::SetPhysicsProfile(FName Profile)
+void UGMCMotionRagdollComponent::SetPhysicsProfile(FName Profile)
 {
 	USkeletalMeshComponent* Mesh = GetMesh();
 	if (!PhysicsControl || !bPhysicsControlReady || !Mesh)
@@ -2357,12 +2485,12 @@ void UGMCGASPRagdollComponent::SetPhysicsProfile(FName Profile)
 	}
 }
 
-void UGMCGASPRagdollComponent::ApplyDefaultPhysicsProfile()
+void UGMCMotionRagdollComponent::ApplyDefaultPhysicsProfile()
 {
 	SetPhysicsProfile(DefaultPhysicsProfile);
 }
 
-void UGMCGASPRagdollComponent::UpdateKinematicBodies(bool bForce)
+void UGMCMotionRagdollComponent::UpdateKinematicBodies(bool bForce)
 {
 	if (!PhysicsControl || !bPhysicsControlReady || AppliedPhysicsProfile == ProfileRagdoll || AppliedPhysicsProfile == ProfileKinematic)
 	{
@@ -2371,7 +2499,7 @@ void UGMCGASPRagdollComponent::UpdateKinematicBodies(bool bForce)
 	static const FName FirstPersonView(TEXT("bFirstPersonView"));
 	// Only outside the montages (get-up, interactions): there the body plays the montage in the physics layer, as in
 	// GASP58.
-	const bool bOverrides = LocalPhase == EGMCGASPRagdollPhase::None;
+	const bool bOverrides = LocalPhase == EGMCMotionRagdollPhase::None;
 	const bool bHead = bOverrides && bKinematicHeadInFirstPerson && IsLocallyControlledPawn() && GetBool(GetOwner(), FirstPersonView, false);
 	if (bForce || bHead != bHeadKinematic)
 	{
@@ -2382,7 +2510,7 @@ void UGMCGASPRagdollComponent::UpdateKinematicBodies(bool bForce)
 	}
 }
 
-void UGMCGASPRagdollComponent::ApplyPhysicalCollision(bool bForce)
+void UGMCMotionRagdollComponent::ApplyPhysicalCollision(bool bForce)
 {
 	USkeletalMeshComponent* Mesh = GetMesh();
 	if (!Mesh || bPhysicalCollisionApplied || (!bForce && DefaultPhysicsProfile == ProfileKinematic))
@@ -2409,7 +2537,7 @@ void UGMCGASPRagdollComponent::ApplyPhysicalCollision(bool bForce)
 	Mesh->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
 }
 
-void UGMCGASPRagdollComponent::RestorePhysicalCollision()
+void UGMCMotionRagdollComponent::RestorePhysicalCollision()
 {
 	USkeletalMeshComponent* Mesh = GetMesh();
 	if (!Mesh || !bPhysicalCollisionApplied)
@@ -2430,17 +2558,17 @@ void UGMCGASPRagdollComponent::RestorePhysicalCollision()
 //  Character interactions (GASP58 shove / tackle / takedown): server search, every machine plays
 // =====================================================================================================================
 
-void UGMCGASPRagdollComponent::OnShoveInput()
+void UGMCMotionRagdollComponent::OnShoveInput()
 {
-	RequestInteraction(EGMCGASPInteractionType::Shove);
+	RequestInteraction(EGMCMotionInteractionType::Shove);
 }
 
-void UGMCGASPRagdollComponent::OnTakedownInput()
+void UGMCMotionRagdollComponent::OnTakedownInput()
 {
-	RequestInteraction(EGMCGASPInteractionType::Takedown);
+	RequestInteraction(EGMCMotionInteractionType::Takedown);
 }
 
-void UGMCGASPRagdollComponent::RequestInteraction(EGMCGASPInteractionType Type)
+void UGMCMotionRagdollComponent::RequestInteraction(EGMCMotionInteractionType Type)
 {
 	if (!GetOwner()->HasAuthority())
 	{
@@ -2450,22 +2578,22 @@ void UGMCGASPRagdollComponent::RequestInteraction(EGMCGASPInteractionType Type)
 	const bool bStarted = TryInteraction(Type, nullptr);
 	if (bDebug)
 	{
-		UE_LOG(LogGMCGASPRagdoll, Log, TEXT("%s interaction request %d: started %d"), *GetNameSafe(GetOwner()), (int32)Type, bStarted);
+		UE_LOG(LogGMCMotionRagdoll, Log, TEXT("%s interaction request %d: started %d"), *GetNameSafe(GetOwner()), (int32)Type, bStarted);
 	}
 }
 
-void UGMCGASPRagdollComponent::ServerRequestInteraction_Implementation(EGMCGASPInteractionType Type)
+void UGMCMotionRagdollComponent::ServerRequestInteraction_Implementation(EGMCMotionInteractionType Type)
 {
 	RequestInteraction(Type);
 }
 
-bool UGMCGASPRagdollComponent::CanDoCharacterInteraction() const
+bool UGMCMotionRagdollComponent::CanDoCharacterInteraction() const
 {
 	// GASP58 CanDoCharacterInteraction: on the ground, no montage in DefaultSlot, not aiming (GMAS State.IsAiming).
 	const UGMCMotion* Motion = GetMotion();
 	const USkeletalMeshComponent* Mesh = GetMesh();
 	const UAnimInstance* AnimInstance = Mesh ? Mesh->GetAnimInstance() : nullptr;
-	if (State.Phase != EGMCGASPRagdollPhase::None || !Motion || !Motion->IsMovingOnGround() || !AnimInstance
+	if (State.Phase != EGMCMotionRagdollPhase::None || !Motion || !Motion->IsMovingOnGround() || !AnimInstance
 		|| AnimInstance->IsSlotActive(TEXT("DefaultSlot")))
 	{
 		return false;
@@ -2475,15 +2603,15 @@ bool UGMCGASPRagdollComponent::CanDoCharacterInteraction() const
 	return !(AimingTag.IsValid() && Abilities && Abilities->HasActiveTag(AimingTag));
 }
 
-bool UGMCGASPRagdollComponent::CanBeInteractedWith() const
+bool UGMCMotionRagdollComponent::CanBeInteractedWith() const
 {
 	// GASP58 CanBeInteractedWith returns only "on the ground". The phase check is ours: a knocked-down, dead or already
 	// interacting pawn has its own replicated montage / ragdoll.
 	const UGMCMotion* Motion = GetMotion();
-	return State.Phase == EGMCGASPRagdollPhase::None && Motion && Motion->IsMovingOnGround();
+	return State.Phase == EGMCMotionRagdollPhase::None && Motion && Motion->IsMovingOnGround();
 }
 
-TArray<AActor*> UGMCGASPRagdollComponent::FindInteractableCharacters() const
+TArray<AActor*> UGMCMotionRagdollComponent::FindInteractableCharacters() const
 {
 	// GASP58 CheckForInteractableCharacters.
 	TArray<AActor*> Result;
@@ -2501,7 +2629,7 @@ TArray<AActor*> UGMCGASPRagdollComponent::FindInteractableCharacters() const
 	for (const FOverlapResult& Overlap : Overlaps)
 	{
 		AActor* Candidate = Overlap.GetActor();
-		const UGMCGASPRagdollComponent* Other = Candidate ? Candidate->FindComponentByClass<UGMCGASPRagdollComponent>() : nullptr;
+		const UGMCMotionRagdollComponent* Other = Candidate ? Candidate->FindComponentByClass<UGMCMotionRagdollComponent>() : nullptr;
 		if (!Other || Candidate == Owner || Result.Contains(Candidate) || !Other->CanBeInteractedWith())
 		{
 			continue;
@@ -2531,7 +2659,7 @@ TArray<AActor*> UGMCGASPRagdollComponent::FindInteractableCharacters() const
 	return Result;
 }
 
-bool UGMCGASPRagdollComponent::TryInteraction(EGMCGASPInteractionType Type, AActor* Target)
+bool UGMCMotionRagdollComponent::TryInteraction(EGMCMotionInteractionType Type, AActor* Target)
 {
 	USkeletalMeshComponent* Mesh = GetMesh();
 	UAnimInstance* AnimInstance = Mesh ? Mesh->GetAnimInstance() : nullptr;
@@ -2542,7 +2670,7 @@ bool UGMCGASPRagdollComponent::TryInteraction(EGMCGASPInteractionType Type, AAct
 	TArray<AActor*> Targets;
 	if (Target)
 	{
-		const UGMCGASPRagdollComponent* Other = Target->FindComponentByClass<UGMCGASPRagdollComponent>();
+		const UGMCMotionRagdollComponent* Other = Target->FindComponentByClass<UGMCMotionRagdollComponent>();
 		if (Other && Target != GetOwner() && Other->CanBeInteractedWith())
 		{
 			Targets.Add(Target);
@@ -2559,13 +2687,13 @@ bool UGMCGASPRagdollComponent::TryInteraction(EGMCGASPInteractionType Type, AAct
 
 	// GASP58 Try_MultiCharacterInteraction: the chooser gives the databases (and roles) for the type and the speed, one
 	// MotionMatchMulti query each, with this pawn's roles and every target's.
-	if (Type == EGMCGASPInteractionType::Tackle)
+	if (Type == EGMCMotionInteractionType::Tackle)
 	{
-		Type = EGMCGASPInteractionType::Shove;
+		Type = EGMCMotionInteractionType::Shove;
 	}
 	const float Speed = GetOwner()->GetVelocity().Size2D();
 	TArray<FPoseSearchMotionMatchMultiQuery> Queries;
-	for (const FGMCGASPInteractionDatabase& Row : InteractionDatabases)
+	for (const FGMCMotionInteractionDatabase& Row : InteractionDatabases)
 	{
 		if (Row.Type != Type || !Row.Database || Speed < Row.MinSpeed || Speed >= Row.MaxSpeed)
 		{
@@ -2609,7 +2737,7 @@ bool UGMCGASPRagdollComponent::TryInteraction(EGMCGASPInteractionType Type, AAct
 				break;
 			}
 		}
-		UGMCGASPRagdollComponent* Ragdoll = Actor ? Actor->FindComponentByClass<UGMCGASPRagdollComponent>() : nullptr;
+		UGMCMotionRagdollComponent* Ragdoll = Actor ? Actor->FindComponentByClass<UGMCMotionRagdollComponent>() : nullptr;
 		if (!Ragdoll)
 		{
 			continue;
@@ -2619,7 +2747,7 @@ bool UGMCGASPRagdollComponent::TryInteraction(EGMCGASPInteractionType Type, AAct
 		bStarted |= bOk;
 		if (bDebug)
 		{
-			UE_LOG(LogGMCGASPRagdoll, Log, TEXT("%s: %s as %s in %s from %.2f s (cost %.2f, db %s), partner %s, started %d"), *GetNameSafe(GetOwner()),
+			UE_LOG(LogGMCMotionRagdoll, Log, TEXT("%s: %s as %s in %s from %.2f s (cost %.2f, db %s), partner %s, started %d"), *GetNameSafe(GetOwner()),
 				*GetNameSafe(Actor), *Result.Role.ToString(), *GetNameSafe(Result.SelectedAnim), Result.SelectedTime, Result.SearchCost,
 				*GetNameSafe(Result.SelectedDatabase), *GetNameSafe(Partner), bOk);
 		}
@@ -2627,18 +2755,18 @@ bool UGMCGASPRagdollComponent::TryInteraction(EGMCGASPInteractionType Type, AAct
 	return bStarted;
 }
 
-bool UGMCGASPRagdollComponent::StartInteractionFromResult(const FPoseSearchBlueprintResult& Result, AActor* InPartner)
+bool UGMCMotionRagdollComponent::StartInteractionFromResult(const FPoseSearchBlueprintResult& Result, AActor* InPartner)
 {
 	UMultiAnimAsset* Asset = Cast<UMultiAnimAsset>(Result.SelectedAnim);
 	UAnimMontage* Montage = Asset ? Cast<UAnimMontage>(Asset->GetAnimationAsset(Result.Role)) : nullptr;
 	const USkeletalMeshComponent* Mesh = GetMesh();
-	if (!GetOwner()->HasAuthority() || !Montage || !Mesh || State.Phase != EGMCGASPRagdollPhase::None)
+	if (!GetOwner()->HasAuthority() || !Montage || !Mesh || State.Phase != EGMCMotionRagdollPhase::None)
 	{
 		return false;
 	}
-	const EGMCGASPRagdollPhase Old = State.Phase;
-	State.Phase = EGMCGASPRagdollPhase::Interacting;
-	State.Injury = EGMCGASPRagdollInjury::None;
+	const EGMCMotionRagdollPhase Old = State.Phase;
+	State.Phase = EGMCMotionRagdollPhase::Interacting;
+	State.Injury = EGMCMotionRagdollInjury::None;
 	State.Impulse = FVector::ZeroVector;
 	State.Montage = Montage;
 	State.MontageStartTime = Result.SelectedTime;
@@ -2665,7 +2793,7 @@ bool UGMCGASPRagdollComponent::StartInteractionFromResult(const FPoseSearchBluep
 
 	InteractionTimeLeft = FMath::Max(0.2f, Montage->GetPlayLength() - Result.SelectedTime - Montage->GetDefaultBlendOutTime());
 	InteractionRagdollTime = -1.f;
-	EGMCGASPRagdollInjury Injury = EGMCGASPRagdollInjury::None;
+	EGMCMotionRagdollInjury Injury = EGMCMotionRagdollInjury::None;
 	float NotifyTime = 0.f;
 	if (FindRagdollNotify(Montage, NotifyTime, Injury) && NotifyTime >= Result.SelectedTime)
 	{
@@ -2689,7 +2817,7 @@ bool UGMCGASPRagdollComponent::StartInteractionFromResult(const FPoseSearchBluep
 	return true;
 }
 
-void UGMCGASPRagdollComponent::EnterInteractionLocal()
+void UGMCMotionRagdollComponent::EnterInteractionLocal()
 {
 	USkeletalMeshComponent* Mesh = GetMesh();
 	UAnimInstance* AnimInstance = Mesh ? Mesh->GetAnimInstance() : nullptr;
@@ -2697,7 +2825,7 @@ void UGMCGASPRagdollComponent::EnterInteractionLocal()
 	{
 		return;
 	}
-	SetMovementAction(ActionNone);
+	SetMovementAction(MovementActionNoneValue);
 	AnimInstance->Montage_Play(State.Montage, 1.f, EMontagePlayReturnType::MontageLength, State.MontageStartTime, true);
 	InteractionRoot = GetOwner()->GetActorTransform();
 	InteractionLastPosition = State.MontageStartTime;
@@ -2720,7 +2848,7 @@ void UGMCGASPRagdollComponent::EnterInteractionLocal()
 		Capsule->SetCollisionResponseToChannel(ECC_Pawn, ECR_Ignore);
 	}
 	InteractionPrerequisiteMesh = nullptr;
-	const UGMCGASPRagdollComponent* PartnerRagdoll = State.Partner ? State.Partner->FindComponentByClass<UGMCGASPRagdollComponent>() : nullptr;
+	const UGMCMotionRagdollComponent* PartnerRagdoll = State.Partner ? State.Partner->FindComponentByClass<UGMCMotionRagdollComponent>() : nullptr;
 	if (USkeletalMeshComponent* PartnerMesh = PartnerRagdoll ? PartnerRagdoll->GetMesh() : nullptr; PartnerMesh && State.bInitiator)
 	{
 		Mesh->AddTickPrerequisiteComponent(PartnerMesh);
@@ -2730,7 +2858,7 @@ void UGMCGASPRagdollComponent::EnterInteractionLocal()
 	bInteractionIKActive = false;
 }
 
-void UGMCGASPRagdollComponent::ExitInteractionLocal()
+void UGMCMotionRagdollComponent::ExitInteractionLocal()
 {
 	if (UCapsuleComponent* Capsule = Cast<UCapsuleComponent>(GetOwner()->GetRootComponent()))
 	{
@@ -2746,10 +2874,10 @@ void UGMCGASPRagdollComponent::ExitInteractionLocal()
 	ClearInteractionConstraints();
 }
 
-void UGMCGASPRagdollComponent::FinishInteraction()
+void UGMCMotionRagdollComponent::FinishInteraction()
 {
-	const EGMCGASPRagdollPhase Old = State.Phase;
-	State.Phase = EGMCGASPRagdollPhase::None;
+	const EGMCMotionRagdollPhase Old = State.Phase;
+	State.Phase = EGMCMotionRagdollPhase::None;
 	State.Montage = nullptr;
 	State.InteractionAsset = nullptr;
 	State.bWarp = false;
@@ -2767,7 +2895,7 @@ void UGMCGASPRagdollComponent::FinishInteraction()
 	State.Partner = nullptr;
 }
 
-void UGMCGASPRagdollComponent::UpdateInteractionMotion()
+void UGMCMotionRagdollComponent::UpdateInteractionMotion()
 {
 	USkeletalMeshComponent* Mesh = GetMesh();
 	UGMCMotion* Motion = GetMotion();
@@ -2873,14 +3001,14 @@ void UGMCGASPRagdollComponent::UpdateInteractionMotion()
 	Motion->SetRagdollCapsuleTarget(InteractionRoot, false);
 }
 
-void UGMCGASPRagdollComponent::UpdateInteractionConstraints(float DeltaTime)
+void UGMCMotionRagdollComponent::UpdateInteractionConstraints(float DeltaTime)
 {
 	// GASP58 SandboxCharacter_Mover_ABP Update_InteractionConstraints: UpdateConstraints at the montage time, then the hands'
 	// constraints (GetConstraint) as the full body IK's targets, relative to the mesh.
 	USkeletalMeshComponent* Mesh = GetMesh();
 	UAnimInstance* AnimInstance = Mesh ? Mesh->GetAnimInstance() : nullptr;
 	UMultiAnimAsset* Asset = State.InteractionAsset;
-	const UGMCGASPRagdollComponent* PartnerRagdoll = State.Partner ? State.Partner->FindComponentByClass<UGMCGASPRagdollComponent>() : nullptr;
+	const UGMCMotionRagdollComponent* PartnerRagdoll = State.Partner ? State.Partner->FindComponentByClass<UGMCMotionRagdollComponent>() : nullptr;
 	USkeletalMeshComponent* PartnerMesh = PartnerRagdoll ? PartnerRagdoll->GetMesh() : nullptr;
 	if (!AnimInstance || !Asset || !PartnerMesh || !State.Montage || !AnimInstance->Montage_IsActive(State.Montage) || Asset->GetNumRoles() != 2)
 	{
@@ -3078,13 +3206,13 @@ void UGMCGASPRagdollComponent::UpdateInteractionConstraints(float DeltaTime)
 	bInteractionIKActive = true;
 }
 
-void UGMCGASPRagdollComponent::ClearInteractionConstraints()
+void UGMCMotionRagdollComponent::ClearInteractionConstraints()
 {
 	InteractionConstraints.Reset();
 	bInteractionIKActive = false;
 }
 
-void UGMCGASPRagdollComponent::UpdateInteractionIKBlendOut(float DeltaTime)
+void UGMCMotionRagdollComponent::UpdateInteractionIKBlendOut(float DeltaTime)
 {
 	// GASP Blend Poses by bool, false: 0.2 s back to the animation once the interaction montage is over.
 	if (bInteractionIKActive || InteractionIKAlpha <= 0.f)

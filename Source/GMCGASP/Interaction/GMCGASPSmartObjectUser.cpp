@@ -2,7 +2,7 @@
 
 #include "Animation/AnimInstance.h"
 #include "Animation/AnimMontage.h"
-#include "Combat/GMCGASPRagdollComponent.h"
+#include "GMCMotionRagdollComponent.h"
 #include "Components/GMCMotion.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Engine/World.h"
@@ -97,8 +97,8 @@ USkeletalMeshComponent* UGMCGASPSmartObjectUser::GetMesh() const
 
 bool UGMCGASPSmartObjectUser::IsRagdollBusy() const
 {
-	const UGMCGASPRagdollComponent* Ragdoll = GetOwner() ? GetOwner()->FindComponentByClass<UGMCGASPRagdollComponent>() : nullptr;
-	return Ragdoll && Ragdoll->GetPhase() != EGMCGASPRagdollPhase::None;
+	const UGMCMotionRagdollComponent* Ragdoll = GetOwner() ? GetOwner()->FindComponentByClass<UGMCMotionRagdollComponent>() : nullptr;
+	return Ragdoll && Ragdoll->GetPhase() != EGMCMotionRagdollPhase::None;
 }
 
 bool UGMCGASPSmartObjectUser::CanUse() const

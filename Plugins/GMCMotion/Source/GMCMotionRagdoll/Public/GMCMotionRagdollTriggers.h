@@ -3,8 +3,8 @@
 #include "CoreMinimal.h"
 #include "Animation/AnimNotifies/AnimNotify.h"
 #include "GameFramework/Actor.h"
-#include "Combat/GMCGASPRagdollComponent.h"
-#include "GMCGASPRagdollTriggers.generated.h"
+#include "GMCMotionRagdollComponent.h"
+#include "GMCMotionRagdollTriggers.generated.h"
 
 class UBoxComponent;
 
@@ -12,8 +12,8 @@ class UBoxComponent;
  * Puts the pawn into ragdoll from an animation (GASP58 BP_AnimNotify_TriggerRagdoll: shoves, tackles, takedowns).
  * The server decides: the notify only acts where the pawn has authority, the clients get the ragdoll through replication.
  */
-UCLASS(meta = (DisplayName = "Trigger Ragdoll (GMCGASP)"))
-class GMCGASP_API UGMCGASPAnimNotify_TriggerRagdoll : public UAnimNotify
+UCLASS(meta = (DisplayName = "Trigger Ragdoll (GMCMotion)"))
+class GMCMOTIONRAGDOLL_API UGMCMotionAnimNotify_TriggerRagdoll : public UAnimNotify
 {
 	GENERATED_BODY()
 
@@ -22,7 +22,7 @@ public:
 	virtual FString GetNotifyName_Implementation() const override { return TEXT("Trigger Ragdoll"); }
 
 	UPROPERTY(EditAnywhere, Category = "Ragdoll")
-	EGMCGASPRagdollInjury Injury = EGMCGASPRagdollInjury::None;
+	EGMCMotionRagdollInjury Injury = EGMCMotionRagdollInjury::None;
 };
 
 /**
@@ -30,12 +30,12 @@ public:
  * (the capsule overlaps the box at the same moves), so each machine switches its own copy.
  */
 UCLASS()
-class GMCGASP_API AGMCGASPZeroGZone : public AActor
+class GMCMOTIONRAGDOLL_API AGMCMotionZeroGZone : public AActor
 {
 	GENERATED_BODY()
 
 public:
-	AGMCGASPZeroGZone();
+	AGMCMotionZeroGZone();
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Zero G")
 	TObjectPtr<UBoxComponent> Zone;

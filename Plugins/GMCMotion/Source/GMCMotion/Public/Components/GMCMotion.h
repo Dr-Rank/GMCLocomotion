@@ -1060,8 +1060,97 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Slope Slide", meta = (ClampMin = "0"))
 	float SlopeSlideBumpProbeDistance = 50.f;
 
+	// Start the slide by itself from the floor angle (SlopeSlideStartAngle), on the ground and when landing. Off: a slide
+	// only starts when requested (SetSlopeSlideRequested, e.g. a crouch press while sprinting) and the pawn walks down
+	// steep slopes it does not ask to slide on.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Slope Slide")
+	bool bSlopeSlideAutoStart = true;
+
+	// A requested slide needs a floor at least this steep (deg), moving downhill.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Slope Slide", meta = (ClampMin = "0", ClampMax = "89"))
+	float SlopeSlideTriggerMinAngle = 20.f;
+
+	// A requested slide needs at least this speed down the fall line (cm/s): sprinting, not running.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Slope Slide", meta = (ClampMin = "0"))
+	float SlopeSlideTriggerMinSpeed = 450.f;
+
+	// Releasing the request (crouch) ends the slide. Ignored while bSlopeSlideAutoStart is on.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Slope Slide")
+	bool bSlopeSlideEndOnRelease = true;
+
+	// Optional: a bool on this component (e.g. a Blueprint's GMC-bound WantsToCrouch) that IS the slide request, read at
+	// the start of every move. A held crouch then starts a slide where CanStartSlopeSlide allows it (in practice a press
+	// while sprinting downhill: crouching drops the speed under SlopeSlideTriggerMinSpeed within a few frames) and
+	// releasing it ends the slide. The bool must be GMC-bound as an input so the server reads the same value on the same
+	// move. None = not used; drive the request with SetSlopeSlideRequested instead.
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "GMCMotion|Slope Slide")
+	FName SlopeSlideRequestProperty = NAME_None;
+
+	// The player's slide request: true while crouch is held after a qualifying press. Write it ONLY through here (it is
+	// bound ClientAuth_Input), from the input event, so it travels with the move. Ignored while SlopeSlideRequestProperty
+	// is set, which overwrites it every move.
+	UFUNCTION(BlueprintCallable, Category = "GMCMotion|Slope Slide")
+	void SetSlopeSlideRequested(bool bRequested);
+
+	UFUNCTION(BlueprintPure, Category = "GMCMotion|Slope Slide")
+	bool IsSlopeSlideRequested() const { return bSlopeSlideRequested; }
+
+	// Whether a requested slide would start now: grounded, floor >= SlopeSlideTriggerMinAngle, downhill speed >=
+	// SlopeSlideTriggerMinSpeed. Ask it at the crouch press to choose the slide over a crouch; the movement update checks
+	// the same thing again inside the move.
+	UFUNCTION(BlueprintPure, Category = "GMCMotion|Slope Slide")
+	bool CanStartSlopeSlide() const;
+
+	static bool ShouldStartRequestedSlopeSlide(bool bRequested, bool bOnGround, float FloorAngle, float MinAngle,
+		double DownhillSpeed, double MinSpeed);
+
+	// bEndOnRelease is the effective switch (bSlopeSlideEndOnRelease && !bSlopeSlideAutoStart).
+	static bool ShouldKeepSlopeSlide(bool bRequested, bool bEndOnRelease, float FloorAngle, float StopAngle, double Speed,
+		double ExitSpeed);
+
 	UFUNCTION(BlueprintPure, Category = "GMCMotion|Slope Slide")
 	bool IsSlopeSliding() const { return GetMovementMode() == SlopeSlideMovementMode; }
+
+	// The velocity a GROUNDED pawn carries into the slide: its horizontal velocity, lifted onto the floor plane (the
+	// horizontal components are kept, Z is solved so the result lies on the plane). A grounded pawn's Velocity is
+	// horizontal, and PhysicsSlopeSlide projects onto the plane, which cost a factor of cos(slope) on the first frame:
+	// measured 375 -> 239 cm/s horizontal on a 35 deg slope, a visible stall that sprinting hid. Falls back to the
+	// projection on a near-vertical surface, where lifting would explode.
+	static FVector ComputeSlopeSlideEntryVelocity(const FVector& GroundVelocity, const FVector& FloorNormal);
+
+	// =====================================================================================
+	//  Camera yaw limit (local player only)
+	// =====================================================================================
+	// Limits the local player's view yaw (PlayerCameraManager ViewYawMin/Max) to a window either side of the pawn's
+	// facing, so a first-person player cannot turn round and see their own body. Applied after the movement update, on
+	// the locally controlled pawn only (never on a server's copy or a simulated proxy); the camera manager's own values
+	// are restored exactly when the limit lifts. 0 disables a limit.
+
+	// While slope sliding. Re-centred every frame on the pawn's facing.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Camera", meta = (ClampMin = "0", ClampMax = "180"))
+	float SlopeSlideCameraYawRange = 0.f;
+
+	// While a component implementing IGMCMotionControlLossSource reports the player out of control (knocked down,
+	// getting up, the target of a shove). Held on the facing at the moment control was lost: a ragdoll's capsule turns
+	// with the tumbling body, which would yank the view.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Camera", meta = (ClampMin = "0", ClampMax = "180"))
+	float KnockdownCameraYawRange = 0.f;
+
+	// Optional: a bool on the owning pawn (e.g. bFirstPersonView) that must be true for either limit to apply, so a
+	// third-person view stays free. None = the limits always apply.
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "GMCMotion|Camera")
+	FName CameraYawLimitConditionProperty = NAME_None;
+
+	UFUNCTION(BlueprintPure, Category = "GMCMotion|Camera")
+	bool IsCameraYawLimited() const { return bCameraYawLimited; }
+
+	// The view yaw window for a centre (deg) and a range either side. Not normalised: APlayerCameraManager::LimitViewYaw
+	// clamps through FMath::ClampAngle, which handles a window that crosses 0/360.
+	static void ComputeCameraYawWindow(float Centre, float Range, float& OutMin, float& OutMax)
+	{
+		OutMin = Centre - Range;
+		OutMax = Centre + Range;
+	}
 
 	// =====================================================================================
 	//  Ground velocity smoothing (GASP58 SmoothWalkingMode)
@@ -1103,7 +1192,7 @@ public:
 	// =====================================================================================
 	//  Ragdoll: the capsule follows the ragdoll (GASP58 BP_MovementMode_Ragdoll)
 	// =====================================================================================
-	// The ragdoll itself lives in UGMCGASPRagdollComponent (game module): server-authoritative bodies, pose streamed to
+	// The ragdoll itself lives in UGMCMotionRagdollComponent (GMCMotionRagdoll): server-authoritative bodies, pose streamed to
 	// the clients. This mode only keeps the capsule on the body. bRagdollMode is decided by the server and GMC-bound
 	// (ServerAuth), so every machine enters the mode at the same move. Each machine moves its capsule to the target its
 	// own ragdoll gives (SetRagdollCapsuleTarget): the clients' bodies follow the server's, so the capsules agree within a
@@ -1338,6 +1427,28 @@ private:
 	// Enters, keeps or leaves SlopeSlideMovementMode from the move's floor (see SlopeSlideStartAngle). Returns true when
 	// the slide owns the mode for this move (UpdateMovementModeDynamic then skips GMC's static update).
 	bool UpdateSlopeSlideMode(const FGMC_FloorParams& Floor);
+
+	// The conditions under which a slide may exist at all (enabled, not downed, upright capsule, gravity, not in water).
+	// Shared by UpdateSlopeSlideMode and CanStartSlopeSlide so the Blueprint's pre-check and the move agree.
+	bool IsSlopeSlideAllowed() const;
+
+	// Speed along the floor's fall line (cm/s, positive = downhill) for a floor normal.
+	double GetSlopeSlideDownhillSpeed(const FVector& FloorNormal) const;
+
+	// The slope slide request (see SetSlopeSlideRequested). Bound ClientAuth_Input: it originates on the client, and the
+	// slide's start and release must evaluate on the same move on every machine, replays included.
+	bool bSlopeSlideRequested = false;
+	int32 BI_SlopeSlideRequested = -1;
+
+	// Applies or lifts the camera yaw limit (see SlopeSlideCameraYawRange). Called from TickComponent.
+	void UpdateCameraYawLimit();
+	bool bCameraYawLimited = false;
+	bool bCameraYawLimitHeld = false;
+	float CameraYawLimitCentre = 0.f;
+	// The camera manager's values before the limit, restored when it lifts.
+	float SavedViewYawMin = 0.f;
+	float SavedViewYawMax = 359.998993f;
+	TWeakObjectPtr<class APlayerCameraManager> LimitedCamera;
 
 	// Floor normal and angle (deg) the slide uses. The line hit (straight under the collision centre) is preferred: on
 	// stairs it finds the flat tread where the shape hit finds the step edge. False when the shape is not within

@@ -24,6 +24,7 @@ public class GMCGASP : ModuleRules
 			"GMCAbilitySystem",
 			// Ragdoll (Combat/GMCGASPRagdollComponent): the capsule-follow movement mode, active ragdoll controls
 			"GMCMotion",
+			"GMCMotionRagdoll",
 			"PhysicsControl",
 			// Get-ups motion matched against the ragdoll pose (GASP58 CHT_GetUpMontages), interactions (MotionMatchMulti)
 			"PoseSearch",

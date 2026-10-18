@@ -27,11 +27,22 @@ Everything stays GMC-replicated (prediction, replays, simulated proxies).
   speeds, feet-float fix, smoother traversal entry / warp window exit, no network foot mismatch.
 - Air traversal catches (GASP 5.8): grabbing ledges while falling.
 
-**Steep slope slide** (GMC movement mode `Custom2`)
-- Involuntary slide on floors steeper than 35 deg (stops under 28 deg, run-out), lateral steering, crouch-height
-  capsule while sliding, slide pose on every client (`UGMCMotion::UpdateSimulatedProxyFloor`).
+**Slope slide** (GMC movement mode `Custom2`)
+- **This project: crouch while sprinting** on a downhill floor of 20 deg or more starts it; releasing crouch (or the slide
+  running out) ends it. Comes from `BP_GMCMovement`'s defaults: `bSlopeSlideAutoStart` off and
+  `SlopeSlideRequestProperty = WantsToCrouch`, so the GMC-bound crouch input is the request, read inside the move.
+- The slide keeps the speed the pawn ran in with (it used to lose a factor of cos(slope) on the first frame:
+  375 -> 239 cm/s horizontal on a 35 deg slope).
+- First person: the camera yaw is limited to +-90 deg of the facing while sliding, and held on the facing at the
+  moment control was lost while knocked down or getting up (`SlopeSlideCameraYawRange`, `KnockdownCameraYawRange`,
+  gated on the pawn's `bFirstPersonView`). Third person is unaffected.
+- GMCMotion's own default is unchanged for other projects: with `bSlopeSlideAutoStart` on, the slide is involuntary on
+  floors steeper than 35 deg (stops under 28 deg, run-out).
+- Lateral steering, crouch-height capsule while sliding, slide pose on every client
+  (`UGMCMotion::UpdateSimulatedProxyFloor`).
 
-**Ragdoll, knockdown, character interactions, death** (GASP 5.8 port, `UGMCGASPRagdollComponent`)
+**Ragdoll, knockdown, character interactions, death** (GASP 5.8 port, `UGMCMotionRagdollComponent` in GMCMotion's
+`GMCMotionRagdoll` module)
 - Server-authoritative active ragdoll streamed to clients, motion-matched get-ups (stand / roll).
 - `B` toggles the ragdoll, `Space` gets up. `,` shove / tackle, `.` takedown (two-character interactions).
 - Knockdown and hit reactions from impacts: call `AddHitImpulse` from your damage code.
@@ -47,17 +58,20 @@ Everything stays GMC-replicated (prediction, replays, simulated proxies).
 
 ## Controls (QWERTY)
 
-`WASD` move, `Shift` sprint, `C` walk, `Left Ctrl` crouch, `Space` jump / traverse, `V` strafe, `B` ragdoll, `E` bench,
+`WASD` move, `Shift` sprint, `C` walk, `Left Ctrl` crouch (slide while sprinting downhill), `Space` jump / traverse, `V` strafe, `B` ragdoll, `E` bench,
 `,` shove, `.` takedown, `F` view, `Tab` shoulder, `Alt` free look.
 
 ## Code
 
-- `Plugins/GMCMotion`: `UGMCMotion` (stance collision, slope slide, ground smoothing, traversal warp, ragdoll mode),
-  `UGMCMotion_AnimInstance`, `UGMC_TrajectoryPredictor`.
-- `Source/GMCGASP`: `Combat/GMCGASPRagdollComponent` (+ triggers), `Interaction/GMCGASPSmartObjectUser` (+ bench
+- `Plugins/GMCMotion`: `UGMCMotion` (stance collision, slope slide, ground smoothing, traversal warp, ragdoll mode,
+  camera yaw limit), `UGMCMotion_AnimInstance`, `UGMC_TrajectoryPredictor`; module `GMCMotionRagdoll`:
+  `UGMCMotionRagdollComponent` (+ triggers). Specs: `GMCMotion.Unit`.
+- `Source/GMCGASP`: `Interaction/GMCGASPSmartObjectUser` (+ bench
   interactable), `Tools/GMCGASPAssetTools` (editor helpers: property text import / export, reference replacement).
 - Config: `Obstacle` object channel + `ObstaclePreset` profile (ragdoll obstacles), ragdoll / foley / locomotion tags.
-- New engine plugin dependency: `PhysicsControl`.
+- New engine plugin dependency: `PhysicsControl` (declared by GMCMotion).
+- The ragdoll classes were renamed from `GMCGASP*` (game module) to `GMCMotion*` (plugin); `[CoreRedirects]` in
+  `Config/DefaultEngine.ini` keeps existing assets loading.
 
 ## Test map
 
