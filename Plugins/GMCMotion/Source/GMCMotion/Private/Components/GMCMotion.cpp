@@ -29,6 +29,7 @@
 #include "Math/SpringMath.h"
 #include "HAL/IConsoleManager.h"
 #include "Containers/Ticker.h"
+#include "Camera/CameraComponent.h"
 #include "Engine/Engine.h"
 
 void UGMCMotion::PhysicsCustom_Implementation(float DeltaSeconds)
@@ -2297,10 +2298,41 @@ namespace
 				{
 					return true;
 				}
-				UE_LOG(LogGMCMotion, Log, TEXT("gmc.Camera.Trace t=%.3f mode=%d sliding=%d pitch=%.1f yaw=%.1f pitchMin=%.1f window=[%.1f,%.1f]"),
+				// Where the view is against the bodies: the camera rides one mesh's bone (attach socket), the player may see
+				// another (e.g. a first-person mesh copying its pose). Distances in cm; -1 = that bone or mesh is missing.
+				const USkeletalMeshComponent* MainMesh = nullptr;
+				const USkeletalMeshComponent* FirstPersonMesh = nullptr;
+				const UCameraComponent* ActiveCamera = nullptr;
+				for (const UActorComponent* Component : Pawn->GetComponents())
+				{
+					if (const USkeletalMeshComponent* Skel = Cast<USkeletalMeshComponent>(Component))
+					{
+						if (Skel->GetFName() == TEXT("FPMesh")) { FirstPersonMesh = Skel; }
+						else if (!MainMesh) { MainMesh = Skel; }
+					}
+					else if (const UCameraComponent* Cam = Cast<UCameraComponent>(Component); Cam && Cam->IsActive() && !ActiveCamera)
+					{
+						ActiveCamera = Cam;
+					}
+				}
+				const FVector View = Camera->GetCameraLocation();
+				auto Dist = [&View](const USkeletalMeshComponent* Mesh, const TCHAR* Bone) -> double
+				{
+					return Mesh && Mesh->GetBoneIndex(Bone) != INDEX_NONE ? FVector::Dist(View, Mesh->GetBoneLocation(Bone)) : -1.;
+				};
+				const double HeadsApart = MainMesh && FirstPersonMesh && MainMesh->GetBoneIndex(TEXT("head")) != INDEX_NONE
+					&& FirstPersonMesh->GetBoneIndex(TEXT("head")) != INDEX_NONE
+					? FVector::Dist(MainMesh->GetBoneLocation(TEXT("head")), FirstPersonMesh->GetBoneLocation(TEXT("head"))) : -1.;
+				const FVector Capsule = Pawn->GetActorLocation();
+				UE_LOG(LogGMCMotion, Log, TEXT("gmc.Camera.Trace t=%.3f mode=%d sliding=%d pitch=%.1f yaw=%.1f pitchMin=%.1f window=[%.1f,%.1f] cam=%s@%s viewAboveCapsule=%.1f viewToMeshHead=%.1f viewToFPHead=%.1f viewToFPNeck=%.1f viewToFPChest=%.1f headsApart=%.1f meshRel=%s"),
 					Pawn->GetWorld()->GetTimeSeconds(), (int32)Motion->GetMovementMode(), Motion->IsSlopeSliding() ? 1 : 0,
 					FRotator::NormalizeAxis(PC->GetControlRotation().Pitch), PC->GetControlRotation().Yaw, Camera->ViewPitchMin,
-					Camera->ViewYawMin, Camera->ViewYawMax);
+					Camera->ViewYawMin, Camera->ViewYawMax,
+					ActiveCamera ? *ActiveCamera->GetName() : TEXT("none"),
+					ActiveCamera ? *ActiveCamera->GetAttachSocketName().ToString() : TEXT("-"),
+					View.Z - Capsule.Z, Dist(MainMesh, TEXT("head")), Dist(FirstPersonMesh, TEXT("head")),
+					Dist(FirstPersonMesh, TEXT("neck_01")), Dist(FirstPersonMesh, TEXT("spine_05")), HeadsApart,
+					MainMesh ? *MainMesh->GetRelativeLocation().ToCompactString() : TEXT("-"));
 				return true;
 			}));
 		}));
