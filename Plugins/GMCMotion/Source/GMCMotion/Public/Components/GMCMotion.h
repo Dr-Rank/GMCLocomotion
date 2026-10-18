@@ -1068,7 +1068,7 @@ public:
 
 	// A requested slide needs a floor at least this steep (deg), moving downhill.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Slope Slide", meta = (ClampMin = "0", ClampMax = "89"))
-	float SlopeSlideTriggerMinAngle = 20.f;
+	float SlopeSlideTriggerMinAngle = 10.f;
 
 	// A requested slide needs at least this speed down the fall line (cm/s): sprinting, not running.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Slope Slide", meta = (ClampMin = "0"))
