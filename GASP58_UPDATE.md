@@ -36,6 +36,9 @@ Everything stays GMC-replicated (prediction, replays, simulated proxies).
 - First person: the camera yaw is limited to +-90 deg of the facing while sliding, and held on the facing at the
   moment control was lost while knocked down or getting up (`SlopeSlideCameraYawRange`, `KnockdownCameraYawRange`,
   gated on the pawn's `bFirstPersonView`). Third person is unaffected.
+- First person can't look down into the body while sliding: the view's lowest pitch eases to -30 deg as the slide
+  starts and back as it ends (`bLimitSlopeSlideCameraPitch`, `SlopeSlideCameraMinPitch`,
+  `SlopeSlideCameraPitchInterpSpeed` on `BP_GMCMovement`).
 - GMCMotion's own default is unchanged for other projects: with `bSlopeSlideAutoStart` on, the slide is involuntary on
   floors steeper than 35 deg (stops under 28 deg, run-out).
 - Lateral steering, crouch-height capsule while sliding, slide pose on every client

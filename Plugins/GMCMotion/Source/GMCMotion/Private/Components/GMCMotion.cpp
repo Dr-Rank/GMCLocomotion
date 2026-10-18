@@ -27,6 +27,9 @@
 #include "UObject/UnrealType.h"
 #include "Curves/CurveFloat.h"
 #include "Math/SpringMath.h"
+#include "HAL/IConsoleManager.h"
+#include "Containers/Ticker.h"
+#include "Engine/Engine.h"
 
 void UGMCMotion::PhysicsCustom_Implementation(float DeltaSeconds)
 {
@@ -2229,6 +2232,80 @@ void UGMCMotion::VariableToAnimBPBridge(const FGASPBridgeData& BD)
 	Downed = BD.Downed;
 }
 
+namespace
+{
+	// The local player's controller in the first game world (debug commands).
+	APlayerController* GMCMotionDebugLocalPC()
+	{
+		if (!GEngine)
+		{
+			return nullptr;
+		}
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Context.World();
+			if (World && World->IsGameWorld())
+			{
+				if (APlayerController* PC = World->GetFirstPlayerController())
+				{
+					return PC;
+				}
+			}
+		}
+		return nullptr;
+	}
+
+	// gmc.Camera.SetView <Pitch> [Yaw]: points the local player's view (deg).
+	FAutoConsoleCommand GGMCMotionCameraSetView(
+		TEXT("gmc.Camera.SetView"),
+		TEXT("gmc.Camera.SetView <Pitch> [Yaw]: point the local player's view (deg)."),
+		FConsoleCommandWithArgsDelegate::CreateLambda([](const TArray<FString>& Args)
+		{
+			APlayerController* PC = GMCMotionDebugLocalPC();
+			if (!PC || Args.Num() < 1)
+			{
+				return;
+			}
+			FRotator View = PC->GetControlRotation();
+			View.Pitch = FCString::Atof(*Args[0]);
+			if (Args.Num() > 1)
+			{
+				View.Yaw = FCString::Atof(*Args[1]);
+			}
+			PC->SetControlRotation(View);
+		}));
+
+	// gmc.Camera.Trace [Seconds=10]: logs, every frame, the local pawn's movement mode, whether it is slope sliding, the
+	// view pitch and yaw, and the camera manager's pitch minimum and yaw window - for tuning the camera limits.
+	FAutoConsoleCommand GGMCMotionCameraTrace(
+		TEXT("gmc.Camera.Trace"),
+		TEXT("gmc.Camera.Trace [Seconds=10]: log the local view and camera limits every frame."),
+		FConsoleCommandWithArgsDelegate::CreateLambda([](const TArray<FString>& Args)
+		{
+			const double EndTime = FPlatformTime::Seconds() + (Args.Num() > 0 ? FCString::Atod(*Args[0]) : 10.);
+			FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([EndTime](float)
+			{
+				if (FPlatformTime::Seconds() > EndTime)
+				{
+					return false;
+				}
+				APlayerController* PC = GMCMotionDebugLocalPC();
+				const APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+				const UGMCMotion* Motion = Pawn ? Pawn->FindComponentByClass<UGMCMotion>() : nullptr;
+				const APlayerCameraManager* Camera = PC ? PC->PlayerCameraManager.Get() : nullptr;
+				if (!Motion || !Camera)
+				{
+					return true;
+				}
+				UE_LOG(LogGMCMotion, Log, TEXT("gmc.Camera.Trace t=%.3f mode=%d sliding=%d pitch=%.1f yaw=%.1f pitchMin=%.1f window=[%.1f,%.1f]"),
+					Pawn->GetWorld()->GetTimeSeconds(), (int32)Motion->GetMovementMode(), Motion->IsSlopeSliding() ? 1 : 0,
+					FRotator::NormalizeAxis(PC->GetControlRotation().Pitch), PC->GetControlRotation().Yaw, Camera->ViewPitchMin,
+					Camera->ViewYawMin, Camera->ViewYawMax);
+				return true;
+			}));
+		}));
+}
+
 float UGMCMotion::ComputeGetUpViewYaw(float FromYaw, float ToYaw, float Alpha)
 {
 	const float Delta = FRotator::NormalizeAxis(ToYaw - FromYaw);
@@ -2254,6 +2331,16 @@ void UGMCMotion::UpdateCameraYawLimit()
 		bCameraYawLimitHeld = false;
 		LimitedCamera.Reset();
 	}
+	// Same for the slide pitch limit.
+	if (bCameraPitchLimited && PitchLimitedCamera.Get() != Camera)
+	{
+		if (APlayerCameraManager* Old = PitchLimitedCamera.Get())
+		{
+			Old->ViewPitchMin = SavedViewPitchMin;
+		}
+		bCameraPitchLimited = false;
+		PitchLimitedCamera.Reset();
+	}
 	if (!Camera)
 	{
 		return;
@@ -2264,6 +2351,44 @@ void UGMCMotion::UpdateCameraYawLimit()
 	{
 		const FBoolProperty* Property = FindFProperty<FBoolProperty>(Pawn->GetClass(), CameraYawLimitConditionProperty);
 		bConditionMet = Property && Property->GetPropertyValue_InContainer(Pawn);
+	}
+
+	// Slide pitch, during the slide only: eased on when it starts - the lowest allowed pitch rises from where the view is
+	// to SlopeSlideCameraMinPitch, and the camera manager's LimitViewPitch carries a lower view up with it every frame
+	// instead of snapping it - and eased off when it ends, back down to the camera's own minimum, then released. A slide
+	// that starts again while it eases off carries on from where it is.
+	const float PitchDeltaSeconds = GetWorld() ? GetWorld()->GetDeltaSeconds() : 0.f;
+	auto EasePitchMin = [this, PitchDeltaSeconds](float Target)
+	{
+		CameraPitchMinCurrent = SlopeSlideCameraPitchInterpSpeed > 0.f
+			? FMath::FInterpTo(CameraPitchMinCurrent, Target, PitchDeltaSeconds, SlopeSlideCameraPitchInterpSpeed)
+			: Target;
+	};
+	if (bLimitSlopeSlideCameraPitch && bConditionMet && IsSlopeSliding())
+	{
+		if (!bCameraPitchLimited)
+		{
+			bCameraPitchLimited = true;
+			SavedViewPitchMin = Camera->ViewPitchMin;
+			PitchLimitedCamera = Camera;
+			CameraPitchMinCurrent = ComputeSlideCameraPitchMinStart(PC->GetControlRotation().Pitch, SlopeSlideCameraMinPitch);
+		}
+		EasePitchMin(SlopeSlideCameraMinPitch);
+		Camera->ViewPitchMin = CameraPitchMinCurrent;
+	}
+	else if (bCameraPitchLimited)
+	{
+		EasePitchMin(SavedViewPitchMin);
+		if (FMath::Abs(CameraPitchMinCurrent - SavedViewPitchMin) < 0.5f)
+		{
+			Camera->ViewPitchMin = SavedViewPitchMin;
+			bCameraPitchLimited = false;
+			PitchLimitedCamera.Reset();
+		}
+		else
+		{
+			Camera->ViewPitchMin = CameraPitchMinCurrent;
+		}
 	}
 
 	float Range = 0.f;

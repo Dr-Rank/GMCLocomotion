@@ -51,6 +51,43 @@ void FSlopeSlideDefaultsSpec::Define()
 		});
 	});
 
+	Describe("Slide camera pitch", [this]()
+	{
+		It("is off by default, so existing users see no change", [this]()
+		{
+			TestFalse("bLimitSlopeSlideCameraPitch", GetDefault<UGMCMotion>()->bLimitSlopeSlideCameraPitch);
+		});
+
+		It("starts at the view when it is lower than the limit, so the view is raised, not snapped", [this]()
+		{
+			// Control rotation pitch 300 = looking 60 deg down.
+			TestEqual("looking down 60", UGMCMotion::ComputeSlideCameraPitchMinStart(300.f, -30.f), -60.f, 1.e-3f);
+			TestEqual("looking down 60 (signed)", UGMCMotion::ComputeSlideCameraPitchMinStart(-60.f, -30.f), -60.f, 1.e-3f);
+		});
+
+		It("starts at the limit when the view is already above it", [this]()
+		{
+			TestEqual("looking down 10", UGMCMotion::ComputeSlideCameraPitchMinStart(350.f, -30.f), -30.f, 1.e-3f);
+			TestEqual("looking up 20", UGMCMotion::ComputeSlideCameraPitchMinStart(20.f, -30.f), -30.f, 1.e-3f);
+		});
+
+		It("rises to the limit quickly and smoothly at the default speed", [this]()
+		{
+			const UGMCMotion* Defaults = GetDefault<UGMCMotion>();
+			float Min = UGMCMotion::ComputeSlideCameraPitchMinStart(-70.f, Defaults->SlopeSlideCameraMinPitch);
+			float Prev = Min;
+			bool bMonotonic = true;
+			for (int32 Frame = 0; Frame < 18; ++Frame) // 0.3 s at 60 fps
+			{
+				Min = FMath::FInterpTo(Min, Defaults->SlopeSlideCameraMinPitch, 1.f / 60.f, Defaults->SlopeSlideCameraPitchInterpSpeed);
+				bMonotonic &= Min >= Prev;
+				Prev = Min;
+			}
+			TestTrue("only ever rises", bMonotonic);
+			TestTrue("within 3 deg of the limit after 0.3 s", FMath::Abs(Min - Defaults->SlopeSlideCameraMinPitch) < 3.f);
+		});
+	});
+
 	Describe("ComputeCameraYawWindow", [this]()
 	{
 		It("centres the window on the facing", [this]()

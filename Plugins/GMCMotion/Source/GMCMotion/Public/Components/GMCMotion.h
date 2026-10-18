@@ -1145,6 +1145,29 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Camera", meta = (ClampMin = "0"))
 	float GetUpViewAlignTime = 0.35f;
 
+	// While slope sliding (and CameraYawLimitConditionProperty, e.g. first person): the local player cannot look further
+	// down than SlopeSlideCameraMinPitch, so a first-person view does not look down into its own sliding body. Only
+	// during the slide: the limit eases on when it starts (a view already lower is raised smoothly rather than snapped)
+	// and eases off when it ends, back to the camera manager's own pitch limit (SlopeSlideCameraPitchInterpSpeed).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Camera")
+	bool bLimitSlopeSlideCameraPitch = false;
+
+	// Lowest view pitch while sliding (deg, negative = looking down).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Camera", meta = (ClampMin = "-89", ClampMax = "89"))
+	float SlopeSlideCameraMinPitch = -30.f;
+
+	// How fast the lowest allowed pitch rises to SlopeSlideCameraMinPitch when the view was lower at the slide start
+	// (FInterpTo speed: 10 settles in ~0.3 s). 0 = at once.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Camera", meta = (ClampMin = "0"))
+	float SlopeSlideCameraPitchInterpSpeed = 10.f;
+
+	// Where the lowest allowed pitch starts at the slide entry: the current view pitch if it is lower than the limit
+	// (so the view is not snapped up), else the limit. ViewPitch is a control rotation pitch (0..360 or -180..180).
+	static float ComputeSlideCameraPitchMinStart(float ViewPitch, float MinPitch)
+	{
+		return FMath::Min(FRotator::NormalizeAxis(ViewPitch), MinPitch);
+	}
+
 	// The view yaw Alpha (0..1, eased) of the way from FromYaw to ToYaw, turning the short way round.
 	static float ComputeGetUpViewYaw(float FromYaw, float ToYaw, float Alpha);
 
@@ -1466,6 +1489,12 @@ private:
 	float SavedViewYawMin = 0.f;
 	float SavedViewYawMax = 359.998993f;
 	TWeakObjectPtr<class APlayerCameraManager> LimitedCamera;
+	// The slide pitch limit (bLimitSlopeSlideCameraPitch): on, the lowest pitch it currently allows, the camera manager's
+	// own minimum to restore, and the camera it was applied to.
+	bool bCameraPitchLimited = false;
+	float CameraPitchMinCurrent = 0.f;
+	float SavedViewPitchMin = -89.9f;
+	TWeakObjectPtr<class APlayerCameraManager> PitchLimitedCamera;
 
 	// Floor normal and angle (deg) the slide uses. The line hit (straight under the collision centre) is preferred: on
 	// stairs it finds the flat tread where the shape hit finds the step edge. False when the shape is not within

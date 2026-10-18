@@ -54,6 +54,13 @@ limit the local player's view yaw around the pawn's facing while sliding or out 
 optionally only while a bool on the pawn is true (`CameraYawLimitConditionProperty`, e.g.
 a first-person flag).
 
+**Slide pitch limit.** With `bLimitSlopeSlideCameraPitch`, the local player cannot look below
+`SlopeSlideCameraMinPitch` while sliding (with the same optional pawn-bool condition), so a
+first-person view does not look into its own body. The limit eases on at the slide start - a
+view already lower is raised smoothly, not snapped - and eases off at the end
+(`SlopeSlideCameraPitchInterpSpeed`). Debug: `gmc.Camera.SetView <Pitch> [Yaw]`,
+`gmc.Camera.Trace [Seconds]`.
+
 **Get-up view.** When a get-up starts, the local player's view turns to the direction the
 body gets up facing (`GetUpViewAlignTime`, 0.35 s), in any view. Otherwise a pawn that faces
 its view snaps round to wherever the camera pointed the moment control comes back.
