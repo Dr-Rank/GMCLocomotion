@@ -16,12 +16,23 @@
 
 static FAutoConsoleCommandWithWorldAndArgs GGMCMotionRagdollKnockdown(
 	TEXT("gmc.Ragdoll.Knockdown"),
-	TEXT("gmc.Ragdoll.Knockdown [self|others|all] [Impulse=20000]: knock pawns down (networked ragdoll)."),
+	TEXT("gmc.Ragdoll.Knockdown [self|others|all] [Impulse=20000] [DelaySeconds=0]: knock pawns down (networked ragdoll)."),
 	FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
 	{
 		if (!World || World->GetNetMode() == NM_Client)
 		{
 			UE_LOG(LogTemp, Warning, TEXT("gmc.Ragdoll.Knockdown: needs the server world"));
+			return;
+		}
+		const float Delay = Args.Num() > 2 ? FCString::Atof(*Args[2]) : 0.f;
+		if (Delay > 0.f)
+		{
+			TArray<FString> Now = {Args[0], Args[1]};
+			FTimerHandle Handle;
+			World->GetTimerManager().SetTimer(Handle, FTimerDelegate::CreateWeakLambda(World, [World, Now]()
+			{
+				IConsoleManager::Get().ProcessUserConsoleInput(*FString::Printf(TEXT("gmc.Ragdoll.Knockdown %s %s"), *Now[0], *Now[1]), *GLog, World);
+			}), Delay, false);
 			return;
 		}
 		const FString Who = Args.Num() > 0 ? Args[0].ToLower() : TEXT("self");
@@ -198,6 +209,55 @@ static FAutoConsoleCommandWithWorldAndArgs GGMCMotionRagdollTrace(
 				Ragdoll->IsFirstPersonRagdollActive() ? 1 : 0, Pawn->GetActorRotation().Yaw, PC->GetControlRotation().Yaw,
 				Camera ? Camera->ViewYawMin : 0.f, Camera ? Camera->ViewYawMax : 0.f,
 				Camera ? Camera->GetCameraRotation().Yaw : 0., HeadDistance);
+			return true;
+		}));
+	}));
+
+// gmc.Ragdoll.TraceBones [Seconds=10]: logs, every frame for Seconds, every pawn in a game world that is ragdolling or
+// getting up: net role, phase, whether any body is awake, the mesh component's location and the world positions of the
+// pelvis, head, right hand and left foot - for finding twitching (large frame-to-frame accelerations of a body that is
+// otherwise still) on the server, the owning client and simulated proxies.
+static FAutoConsoleCommandWithWorldAndArgs GGMCMotionRagdollTraceBones(
+	TEXT("gmc.Ragdoll.TraceBones"),
+	TEXT("gmc.Ragdoll.TraceBones [Seconds=10]: log ragdolling pawns' bones and mesh every frame."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
+	{
+		if (!World)
+		{
+			return;
+		}
+		const double Seconds = Args.Num() > 0 ? FCString::Atod(*Args[0]) : 10.;
+		const double EndTime = FPlatformTime::Seconds() + Seconds;
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([EndTime](float)
+		{
+			if (FPlatformTime::Seconds() > EndTime)
+			{
+				return false;
+			}
+			static const FName Bones[] = {TEXT("pelvis"), TEXT("head"), TEXT("hand_r"), TEXT("foot_l")};
+			for (TObjectIterator<UGMCMotionRagdollComponent> It; It; ++It)
+			{
+				const APawn* Pawn = Cast<APawn>(It->GetOwner());
+				UWorld* W = Pawn ? Pawn->GetWorld() : nullptr;
+				if (!W || !W->IsGameWorld() || It->GetPhase() == EGMCMotionRagdollPhase::None)
+				{
+					continue;
+				}
+				USkeletalMeshComponent* Mesh = Pawn->FindComponentByClass<USkeletalMeshComponent>();
+				if (!Mesh)
+				{
+					continue;
+				}
+				FString Line = FString::Printf(TEXT("t=%.4f pawn=%s role=%d phase=%d awake=%d mesh=%s"), W->GetTimeSeconds(),
+					*Pawn->GetName(), (int32)Pawn->GetLocalRole(), (int32)It->GetPhase(), Mesh->IsAnyRigidBodyAwake() ? 1 : 0,
+					*Mesh->GetComponentLocation().ToCompactString());
+				for (const FName& Bone : Bones)
+				{
+					const FVector P = Mesh->GetBoneLocation(Bone);
+					Line += FString::Printf(TEXT(" %s=%.2f,%.2f,%.2f"), *Bone.ToString(), P.X, P.Y, P.Z);
+				}
+				UE_LOG(LogTemp, Log, TEXT("gmc.Ragdoll.TraceBones %s"), *Line);
+			}
 			return true;
 		}));
 	}));
