@@ -52,8 +52,11 @@ release (`bSlopeSlideEndOnRelease`).
 **Camera yaw limit.** `SlopeSlideCameraYawRange` and `KnockdownCameraYawRange` (0 = off)
 limit the local player's view yaw around the pawn's facing while sliding or out of control,
 optionally only while a bool on the pawn is true (`CameraYawLimitConditionProperty`, e.g.
-a first-person flag). When a get-up starts, the view turns to the direction the body gets
-up facing (`GetUpViewAlignTime`).
+a first-person flag).
+
+**Get-up view.** When a get-up starts, the local player's view turns to the direction the
+body gets up facing (`GetUpViewAlignTime`, 0.35 s), in any view. Otherwise a pawn that faces
+its view snaps round to wherever the camera pointed the moment control comes back.
 
 **First-person ragdoll.** `bFirstPersonRagdoll` on `UGMCMotionRagdollComponent` keeps a
 first-person pawn on its head camera while down and getting up, instead of switching to the

@@ -2273,24 +2273,29 @@ void UGMCMotion::UpdateCameraYawLimit()
 	{
 		Range = SlopeSlideCameraYawRange;
 	}
-	if (bConditionMet && Range <= 0.f && KnockdownCameraYawRange > 0.f)
+	bool bSourceControlLost = false;
+	for (const UActorComponent* Component : Pawn->GetComponents())
 	{
-		for (const UActorComponent* Component : Pawn->GetComponents())
+		const IGMCMotionControlLossSource* Source = Cast<IGMCMotionControlLossSource>(Component);
+		if (Source && Source->IsPlayerControlLost())
 		{
-			const IGMCMotionControlLossSource* Source = Cast<IGMCMotionControlLossSource>(Component);
-			if (Source && Source->IsPlayerControlLost())
-			{
-				Range = KnockdownCameraYawRange;
-				bControlLost = true;
-				bGettingUp = Source->IsGettingUp();
-				break;
-			}
+			bSourceControlLost = true;
+			bGettingUp = Source->IsGettingUp();
+			break;
 		}
 	}
+	if (bConditionMet && Range <= 0.f && KnockdownCameraYawRange > 0.f && bSourceControlLost)
+	{
+		Range = KnockdownCameraYawRange;
+		bControlLost = true;
+	}
 
-	// The get-up: turn the view to the facing the body gets up with, then let the window follow the body (the capsule
-	// follows the get-up montage from here, it no longer tumbles).
-	const bool bAlignGetUp = bGettingUp && Range > 0.f && GetUpViewAlignTime > 0.f;
+	// The get-up: turn the view to the facing the body gets up with (the capsule follows the get-up montage from here, it
+	// no longer tumbles), then, inside the window, let the window follow the body. With or without the window: once
+	// control comes back, a pawn that faces its view (strafe / aim rotation) turns to the view, so a view left wherever
+	// the camera orbited snapped the body round the moment the get-up ended (measured: -103 -> 180 in one frame, in third
+	// person - not caused by first person, which only came back a few frames later).
+	const bool bAlignGetUp = bGettingUp && GetUpViewAlignTime > 0.f;
 	if (!bAlignGetUp)
 	{
 		bGetUpViewAlignStarted = false;
@@ -2315,7 +2320,10 @@ void UGMCMotion::UpdateCameraYawLimit()
 			bGetUpViewAligned = Alpha >= 1.f;
 		}
 		// Centred on the view while it turns (so the window never clamps it back mid-turn), on the body after.
-		CameraYawLimitCentre = bGetUpViewAligned ? Facing : PC->GetControlRotation().Yaw;
+		if (Range > 0.f)
+		{
+			CameraYawLimitCentre = bGetUpViewAligned ? Facing : PC->GetControlRotation().Yaw;
+		}
 		bControlLost = false;
 	}
 
@@ -2329,7 +2337,7 @@ void UGMCMotion::UpdateCameraYawLimit()
 		}
 		// The slide re-centres every frame on the facing; a control loss holds the facing it started at; the get-up set
 		// its own centre above.
-		if (!bAlignGetUp && (!bControlLost || !bCameraYawLimited || !bCameraYawLimitHeld))
+		if (!(bAlignGetUp && Range > 0.f) && (!bControlLost || !bCameraYawLimited || !bCameraYawLimitHeld))
 		{
 			CameraYawLimitCentre = GetActorRotation_GMC().Yaw;
 		}

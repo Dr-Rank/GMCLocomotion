@@ -1136,11 +1136,12 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Camera", meta = (ClampMin = "0", ClampMax = "180"))
 	float KnockdownCameraYawRange = 0.f;
 
-	// With KnockdownCameraYawRange: when the get-up starts the view turns to the direction the body gets up facing over
-	// this long (s), and the window then follows the body for the rest of the get-up. The capsule turns with the
-	// tumbling body while it is down, so the get-up can face anywhere: with the window still held on the facing at the
-	// knockdown, a first-person view looked at the rising body side-on and the body snapped round to the view once
-	// standing (measured in CLEAR: got up facing 234 with the view held at 180). 0 = no turn.
+	// When a get-up starts (IGMCMotionControlLossSource::IsGettingUp) the local player's view turns to the direction the
+	// body gets up facing over this long (s); with KnockdownCameraYawRange the window then follows the body for the rest
+	// of the get-up. The capsule turns with the tumbling body while it is down, so the get-up can face anywhere: a first-
+	// person view held on the facing at the knockdown looked at the rising body side-on, and in any view a pawn that faces
+	// its view snapped round to it the moment control came back (measured: 234 -> 180 in CLEAR, -103 -> 180 in third
+	// person here). 0 = no turn.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Camera", meta = (ClampMin = "0"))
 	float GetUpViewAlignTime = 0.35f;
 

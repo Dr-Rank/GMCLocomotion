@@ -30,7 +30,7 @@ void FSlopeSlideDefaultsSpec::Define()
 			TestEqual("SlopeSlideCameraYawRange", Defaults->SlopeSlideCameraYawRange, 0.f);
 			TestEqual("KnockdownCameraYawRange", Defaults->KnockdownCameraYawRange, 0.f);
 			TestTrue("no camera condition", Defaults->CameraYawLimitConditionProperty.IsNone());
-			// The get-up view turn only acts inside the knockdown limit, which stays off.
+			// The get-up view turn: on by default, for any get-up a control-loss source reports.
 			TestEqual("GetUpViewAlignTime", Defaults->GetUpViewAlignTime, 0.35f);
 		});
 
