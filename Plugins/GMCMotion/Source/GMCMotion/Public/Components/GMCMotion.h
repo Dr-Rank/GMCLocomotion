@@ -1199,6 +1199,11 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Ground Smoothing")
 	bool bSmoothGroundVelocity = true;
 
+	// Owned root-motion integrators (e.g. Traverse Anywhere's traversal) bypass CalculateVelocity. Invalidate the grounded
+	// spring so the first ordinary grounded move initialises from the actual velocity. The flag already takes part in
+	// GMC prediction and replay. (Traverse Anywhere TraversalGMC 1636 calls this.)
+	void InvalidateGroundVelocitySmoothing() { bSmoothStateValid = false; }
+
 	// Spring smoothing time (s) while speeding up / slowing down (GASP58 Acceleration/DecelerationSmoothingTime).
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GMCMotion|Ground Smoothing", meta = (ClampMin = "0"))
 	float GroundAccelerationSmoothingTime = 0.1f;
